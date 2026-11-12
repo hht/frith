@@ -28,18 +28,33 @@ pub struct FontConfig {
     pub fallbacks: Vec<String>,
 }
 
-/// A typeface in regular and bold.
+/// One typeface of the lookup order, as indices into `Fonts::fonts`.
 struct Face {
-    regular: Font,
-    bold: Font,
+    regular: usize,
+    /// The family's real bold face, when it has one heavier than regular.
+    bold: Option<usize>,
+    /// The regular face emboldened, for bold text the real bold face has no glyph for
+    /// (Menlo Bold lacks the box-drawing characters Menlo Regular has).
+    synthetic_bold: usize,
+}
+
+/// A glyph id together with the font it belongs to. Ids are per typeface (Menlo Regular and
+/// Bold number 485 shared code points differently), so an id is meaningless without its font.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct Glyph {
+    /// Index of the font that draws it; see `Fonts::font`.
+    pub font: usize,
+    pub id: GlyphId,
 }
 
 pub struct Fonts {
     mgr: FontMgr,
     size: f32,
-    /// Configured and bundled faces first, then faces the system fallback supplied.
+    /// Every font a `Glyph` can name.
+    fonts: Vec<Font>,
+    /// Lookup order: configured and bundled faces first, then faces the system fallback supplied.
     faces: Vec<Face>,
-    map: HashMap<char, Option<(usize, GlyphId)>>,
+    map: HashMap<(char, bool), Option<Glyph>>,
     pub cell_w: f32,
     pub cell_h: f32,
     pub ascent: f32,
@@ -62,55 +77,68 @@ impl Fonts {
         });
         let nerd = mgr.new_from_data(Data::new_copy(NERD_SYMBOLS), None).expect("bundled Nerd Font parses");
         let typefaces: Vec<Typeface> = std::iter::once(primary).chain(configured).chain([nerd]).collect();
-        let faces = typefaces.into_iter().map(|tf| face(&mgr, tf, size)).collect::<Vec<_>>();
-        let font = &faces[0].regular;
+        let mut fonts = Vec::new();
+        let faces = typefaces.into_iter().map(|tf| add_face(&mut fonts, &mgr, tf, size)).collect::<Vec<_>>();
+        let font = &fonts[faces[0].regular];
         let (_, m) = font.metrics();
         let cell_h = (m.descent - m.ascent + m.leading).ceil();
         let cell_w = font.measure_str("M", None).0.round();
         let ascent = (-m.ascent).round();
-        Fonts { mgr, size, faces, map: HashMap::new(), cell_w, cell_h, ascent }
+        Fonts { mgr, size, fonts, faces, map: HashMap::new(), cell_w, cell_h, ascent }
     }
 
-    /// The face index and glyph that draw `c`, or `None` when no usable font has it.
-    pub fn lookup(&mut self, c: char) -> Option<(usize, GlyphId)> {
-        if let Some(v) = self.map.get(&c) {
-            return *v;
+    /// The glyph that draws `c` in regular or bold, or `None` when no usable font has it.
+    /// The face is chosen by regular coverage, so bold and regular text agree on the face.
+    pub fn lookup(&mut self, c: char, bold: bool) -> Option<Glyph> {
+        if let Some(g) = self.map.get(&(c, bold)) {
+            return *g;
         }
-        let known = self.faces.iter().enumerate().find_map(|(i, f)| {
-            let g = f.regular.unichar_to_glyph(c as i32);
-            (g != 0).then_some((i, g))
-        });
-        let found = known.or_else(|| {
-            let tf = self.mgr.match_family_style_character("", FontStyle::normal(), &FALLBACK_LANGS, c as i32)?;
-            if tf.family_name() == LAST_RESORT {
-                return None;
-            }
-            let f = face(&self.mgr, tf, self.size);
-            let g = f.regular.unichar_to_glyph(c as i32);
-            if g == 0 {
-                return None;
-            }
-            self.faces.push(f);
-            Some((self.faces.len() - 1, g))
-        });
-        self.map.insert(c, found);
+        let has = |font: &Font| font.unichar_to_glyph(c as i32) != 0;
+        let face = self.faces.iter().position(|f| has(&self.fonts[f.regular])).or_else(|| self.fallback_face(c));
+        let found = face.map(|i| self.styled(i, c, bold));
+        self.map.insert((c, bold), found);
         found
     }
 
-    pub fn font(&self, idx: usize, bold: bool) -> &Font {
-        let face = &self.faces[idx];
-        if bold { &face.bold } else { &face.regular }
+    pub fn font(&self, g: Glyph) -> &Font {
+        &self.fonts[g.font]
+    }
+
+    /// Asks the system for a face that has `c` and appends it to the lookup order.
+    fn fallback_face(&mut self, c: char) -> Option<usize> {
+        let tf = self.mgr.match_family_style_character("", FontStyle::normal(), &FALLBACK_LANGS, c as i32)?;
+        if tf.family_name() == LAST_RESORT || tf.unichar_to_glyph(c as i32) == 0 {
+            return None;
+        }
+        let face = add_face(&mut self.fonts, &self.mgr, tf, self.size);
+        self.faces.push(face);
+        Some(self.faces.len() - 1)
+    }
+
+    /// The glyph for `c` in face `i`, whose regular font has it.
+    fn styled(&self, i: usize, c: char, bold: bool) -> Glyph {
+        let f = &self.faces[i];
+        let glyph = |font: usize| Glyph { font, id: self.fonts[font].unichar_to_glyph(c as i32) };
+        if !bold {
+            return glyph(f.regular);
+        }
+        f.bold.map(glyph).filter(|g| g.id != 0).unwrap_or_else(|| glyph(f.synthetic_bold))
     }
 }
 
-/// `tf` in regular and bold: the family's real bold face when it has one, otherwise
-/// synthetic emboldening.
-fn face(mgr: &FontMgr, tf: Typeface, size: f32) -> Face {
+/// Adds `tf`'s regular, real bold (when the family has one) and synthetic bold fonts.
+fn add_face(fonts: &mut Vec<Font>, mgr: &FontMgr, tf: Typeface, size: f32) -> Face {
     let bold_tf = mgr
         .match_family_style(tf.family_name(), FontStyle::bold())
         .filter(|b| b.font_style().weight() > tf.font_style().weight());
-    let embolden = bold_tf.is_none();
-    Face { regular: font(tf.clone(), size, false), bold: font(bold_tf.unwrap_or(tf), size, embolden) }
+    let mut push = |f: Font| {
+        fonts.push(f);
+        fonts.len() - 1
+    };
+    let regular = push(font(tf.clone(), size, false));
+    let bold = bold_tf.map(|b| push(font(b, size, false)));
+    let synthetic_bold = push(font(tf, size, true));
+    Face { regular, bold, synthetic_bold }
 }
 
 fn font(tf: Typeface, size: f32, embolden: bool) -> Font {
@@ -130,7 +158,26 @@ mod tests {
     }
 
     fn family(f: &mut Fonts, c: char) -> Option<String> {
-        f.lookup(c).map(|(i, _)| f.font(i, false).typeface().family_name())
+        f.lookup(c, false).map(|g| f.font(g).typeface().family_name())
+    }
+
+    #[test]
+    fn bold_glyphs_come_from_the_bold_face_or_else_an_emboldened_regular_one() {
+        let mut f = fonts();
+        for c in ['a', '●', '❯', '✓'] {
+            let g = f.lookup(c, true).unwrap();
+            let font = f.font(g);
+            assert_eq!(*font.typeface().font_style().weight(), 700, "{c}: drawn by Menlo Bold");
+            assert_eq!(font.unichar_to_glyph(c as i32), g.id, "{c}: glyph id of the font that draws it");
+        }
+        // Menlo Bold has no box-drawing characters; Menlo Regular does.
+        let g = f.lookup('─', true).unwrap();
+        assert_eq!((*f.font(g).typeface().font_style().weight(), f.font(g).is_embolden()), (400, true));
+        assert_eq!(f.font(g).unichar_to_glyph('─' as i32), g.id);
+        let g = f.lookup('\u{f07b}', true).unwrap();
+        assert!(f.font(g).is_embolden(), "the bundled Nerd font has no bold face");
+        let g = f.lookup('●', false).unwrap();
+        assert_eq!((*f.font(g).typeface().font_style().weight(), f.font(g).is_embolden()), (400, false));
     }
 
     #[test]
@@ -148,12 +195,12 @@ mod tests {
     #[test]
     fn han_still_resolves_after_a_character_no_font_covers() {
         let mut f = fonts();
-        let odd = f.lookup('\u{10fffd}').map(|(i, g)| (f.font(i, false).typeface().family_name(), g));
+        let odd = f.lookup('\u{10fffd}', false).map(|g| (f.font(g).typeface().family_name(), g));
         assert_eq!(odd, None, "only LastResort claims this; it must not be used");
         let han = family(&mut f, '世').expect("a system CJK font");
         assert!(!han.contains("LastResort"), "{han}");
-        let (i, g) = f.lookup('世').unwrap();
-        assert_ne!(g, 0);
-        assert_eq!(f.font(i, false).unichar_to_glyph('世' as i32), g);
+        let g = f.lookup('世', false).unwrap();
+        assert_ne!(g.id, 0);
+        assert_eq!(f.font(g).unichar_to_glyph('世' as i32), g.id);
     }
 }
