@@ -1,0 +1,5 @@
+# Toolchain pins for the whole workspace. Run builds as `mise exec -- cargo …`.
+[tools]
+rust = "1.99.1"
+# libghostty-vt builds only with Zig 0.17.x.
+zig = "0.17.1"

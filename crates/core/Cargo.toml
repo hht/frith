@@ -1,0 +1,10 @@
+# Pure core: pane arrangement, chrome geometry, gestures, motion. No dependencies, so it
+# stays testable without a window, a GPU, or a terminal.
+[package]
+name = "frith-core"
+version = "0.0.0"
+edition.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
