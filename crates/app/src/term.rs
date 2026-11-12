@@ -460,15 +460,17 @@ fn make_terminal(
     let mut t = Terminal::new(size.cols, size.rows).expect("terminal");
     t.set_scrollback_max_lines(Some(10_000)).unwrap().set_terminfo_name(TERM).unwrap();
     // The configured colors become the terminal's defaults, which programs query (OSC 4,
-    // 10, 11, 12) and may override; unset ones keep libghostty-vt's.
+    // 10, 11, 12) and may override. Background and foreground are always set: without them
+    // libghostty-vt draws white on black and answers no OSC 10 or 11 query. An unset cursor
+    // color and palette entries keep libghostty-vt's.
     let rgb = |c: frith_core::config::Rgb| Rgb { r: c.r, g: c.g, b: c.b };
     let mut palette = t.default_color_palette().unwrap();
     for (&i, &c) in &config.palette {
         palette.0[usize::from(i)] = rgb(c);
     }
-    t.set_default_fg_color(config.foreground.map(rgb))
+    t.set_default_fg_color(Some(rgb(config.foreground)))
         .unwrap()
-        .set_default_bg_color(config.background.map(rgb))
+        .set_default_bg_color(Some(rgb(config.background)))
         .unwrap()
         .set_default_cursor_color(config.cursor_color.map(rgb))
         .unwrap()
@@ -728,6 +730,17 @@ mod tests {
                 assert!(Instant::now() < deadline, "stalled without a wake: {:?}", s.screen_text());
                 thread::sleep(Duration::from_millis(1));
             }
+        }
+    }
+
+    #[test]
+    fn without_a_config_the_terminal_reports_ghosttys_default_colors() {
+        let line = "stty raw -echo min 0 time 5; printf '\\033]10;?\\a\\033]11;?\\a'; \
+                    r=$(cat); stty sane; printf '%s' \"$r\" | tr '\\007' '\\n' | cat -v; echo end";
+        let s = started(line, "end");
+        let text = s.screen_text();
+        for want in ["]10;rgb:ffff/ffff/ffff", "]11;rgb:2828/2c2c/3434"] {
+            assert!(text.contains(want), "no {want:?} in {text:?}");
         }
     }
 

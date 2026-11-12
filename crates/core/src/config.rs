@@ -30,9 +30,9 @@ pub struct Config {
     pub font_family: Vec<String>,
     /// In points.
     pub font_size: f32,
-    /// `None` keeps the terminal's own default.
-    pub background: Option<Rgb>,
-    pub foreground: Option<Rgb>,
+    pub background: Rgb,
+    pub foreground: Rgb,
+    /// `None` draws the cursor in the chrome's accent.
     pub cursor_color: Option<Rgb>,
     /// Palette entries the user set; the others keep the terminal's defaults.
     pub palette: BTreeMap<u8, Rgb>,
@@ -41,14 +41,15 @@ pub struct Config {
 }
 
 /// Ghostty's defaults, so a Ghostty config that leaves a key out looks the same in Frith.
-/// @see Ghostty `src/config/Config.zig` (`font-size`, `window-padding-x`, `window-padding-y`)
+/// @see Ghostty `src/config/Config.zig` (`font-size`, `background`, `foreground`,
+/// `window-padding-x`, `window-padding-y`)
 impl Default for Config {
     fn default() -> Config {
         Config {
             font_family: Vec::new(),
             font_size: 13.0,
-            background: None,
-            foreground: None,
+            background: Rgb { r: 0x28, g: 0x2c, b: 0x34 },
+            foreground: Rgb { r: 0xff, g: 0xff, b: 0xff },
             cursor_color: None,
             palette: BTreeMap::new(),
             padding_x: Padding { start: 2.0, end: 2.0 },
@@ -108,8 +109,8 @@ impl Config {
             "font-family" => self.font_family.push(value.to_string()),
             "font-size" if empty => self.font_size = d.font_size,
             "font-size" => self.font_size = size(value)?,
-            "background" => self.background = if empty { d.background } else { Some(color(value)?) },
-            "foreground" => self.foreground = if empty { d.foreground } else { Some(color(value)?) },
+            "background" => self.background = if empty { d.background } else { color(value)? },
+            "foreground" => self.foreground = if empty { d.foreground } else { color(value)? },
             "cursor-color" => self.cursor_color = if empty { d.cursor_color } else { Some(color(value)?) },
             "palette" if empty => self.palette = d.palette,
             "palette" => {
@@ -203,8 +204,8 @@ mod tests {
         let want = Config {
             font_family: vec!["Cascadia Code NF".into()],
             font_size: 12.0,
-            background: Some(rgb(0x21252b)),
-            foreground: Some(rgb(0xabb2bf)),
+            background: rgb(0x21252b),
+            foreground: rgb(0xabb2bf),
             cursor_color: Some(rgb(0xabb2bf)),
             palette: BTreeMap::from([(0, rgb(0x21252b)), (12, rgb(0x61afef))]),
             padding_x: Padding { start: 8.0, end: 8.0 },
@@ -225,7 +226,7 @@ mod tests {
              window-padding-y = wide\n\
              just some words\n",
         );
-        assert_eq!(c.background, Some(rgb(0x102030)));
+        assert_eq!(c.background, rgb(0x102030));
         assert_eq!(c.font_size, 13.0);
         assert!(c.palette.is_empty());
         assert_eq!((c.padding_x, c.padding_y), (Config::default().padding_x, Config::default().padding_y));
@@ -257,6 +258,12 @@ mod tests {
     fn defaults_and_limits_follow_ghostty() {
         let d = Config::default();
         assert_eq!((d.font_size, d.padding_x, d.padding_y), (13.0, Padding { start: 2.0, end: 2.0 }, d.padding_x));
+        // Without these the terminal draws black: libghostty-vt leaves the defaults to its
+        // caller (src/terminal/render.zig, `bg_fg`).
+        assert_eq!((d.background, d.foreground), (rgb(0x282c34), rgb(0xffffff)));
+        let mut c = Config::default();
+        c.read("background = #000\nforeground = #000\nbackground =\nforeground =\n");
+        assert_eq!((c.background, c.foreground), (d.background, d.foreground), "an empty value restores them");
         let mut c = Config::default();
         c.read("font-size = 0.5\n");
         assert_eq!(c.font_size, 1.0);
