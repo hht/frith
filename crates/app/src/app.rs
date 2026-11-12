@@ -119,8 +119,9 @@ pub struct App {
     shot: Option<String>,
     start: Instant,
     script_next: usize,
-    /// The earliest deadline of a frame hold (DEC 2026) among the panes last drawn.
-    hold_end: Option<Instant>,
+    /// When a pane last drawn next needs a frame without any event: its frame hold (DEC
+    /// 2026) ends (`Session::hold`) or its gathered resize is due (`Session::resize`).
+    frame_due: Option<Instant>,
 }
 
 impl App {
@@ -147,7 +148,7 @@ impl App {
             shot: None,
             start: Instant::now(),
             script_next: 0,
-            hold_end: None,
+            frame_due: None,
         }
     }
 
@@ -347,12 +348,12 @@ impl App {
             return;
         }
         let scene = self.scene();
+        let now = Instant::now();
+        let mut frame_due = None;
         for f in scene.tiles.iter().chain(&scene.cards) {
             let size = self.grid_size(f.content);
             let pane = self.panes.get_mut(&f.pane).expect("every placed pane exists");
-            if pane.session.resize(size) {
-                pane.grid.invalidate();
-            }
+            frame_due = [frame_due, pane.session.resize(size, now)].into_iter().flatten().min();
         }
         let lit = match (self.gesture, self.hover) {
             (Gesture::DraggingDivider(i), _) | (_, Hit::Divider(i)) => Some(i),
@@ -375,8 +376,6 @@ impl App {
         let Win { gpu, fonts, atlas, scale, .. } = w;
         let scale = *scale;
         let pad = (GRID_PAD * scale).round();
-        let now = Instant::now();
-        let mut hold_end = None;
         let cursor = gpu.present(shot.as_deref(), |canvas, ctx| {
             render::background(canvas, &scene);
             let mut cursor = None;
@@ -388,7 +387,7 @@ impl App {
                 let p = panes.get_mut(&f.pane).expect("every placed pane exists");
                 let focused = Some(f.pane) == focus;
                 let held = p.session.hold(now);
-                hold_end = [hold_end, held].into_iter().flatten().min();
+                frame_due = [frame_due, held].into_iter().flatten().min();
                 let c = SkRect::from_xywh(f.content.x, f.content.y, f.content.w, f.content.h);
                 let look = grid::Look { content: c, pad, focused, cursor: theme::ACCENT, update: held.is_none() };
                 let at = p.grid.draw(canvas, fonts, atlas, ctx, &p.session.term, &look);
@@ -425,6 +424,7 @@ impl App {
             }
             cursor
         });
+        self.frame_due = frame_due;
         let Some(cursor) = cursor else { return };
         if let Some(c) = cursor.filter(|c| self.ime_area != Some(*c)) {
             self.ime_area = Some(c);
@@ -438,19 +438,18 @@ impl App {
             w.window.set_title(if title.is_empty() { "Frith" } else { &title });
             self.title = title;
         }
-        self.hold_end = hold_end;
     }
 
-    /// Wakes the event loop for the next script step and for the earliest frame hold that
-    /// must end (see `Session::hold`); the end of a hold needs a frame even if no output comes.
-    /// Runs in `about_to_wait`, which on macOS follows every redraw, so it sees `hold_end`.
+    /// Wakes the event loop for the next script step and for `frame_due`: the end of a frame
+    /// hold or a gathered resize needs a frame even if no event comes.
+    /// Runs in `about_to_wait`, which on macOS follows every redraw, so it sees `frame_due`.
     fn schedule(&mut self, el: &dyn ActiveEventLoop) {
-        if self.hold_end.is_some_and(|t| t <= Instant::now()) {
-            self.hold_end = None;
+        if self.frame_due.is_some_and(|t| t <= Instant::now()) {
+            self.frame_due = None;
             self.redraw();
         }
         let step = self.cfg.script.get(self.script_next).map(|s| self.start + Duration::from_secs_f32(s.at));
-        let wake = [step, self.hold_end].into_iter().flatten().min();
+        let wake = [step, self.frame_due].into_iter().flatten().min();
         el.set_control_flow(wake.map_or(ControlFlow::Wait, ControlFlow::WaitUntil));
     }
 

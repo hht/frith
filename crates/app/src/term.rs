@@ -44,6 +44,10 @@ const OUTPUT_CAP: usize = 1 << 20;
 /// The longest a program may hold its frame (DEC 2026); Ghostty's `sync_reset_ms`.
 /// @see https://github.com/ghostty-org/ghostty/blob/108cacb17ed8990840cd14abfce43d8ed8503ca1/src/termio/Thread.zig (`sync_reset_ms`)
 const HOLD_LIMIT: Duration = Duration::from_secs(1);
+/// How long resizes gather after the first before one reaches the terminal and the child,
+/// so a dragged window edge sends a burst of SIGWINCH as one; Ghostty's `Coalesce.min_ms`.
+/// @see https://github.com/ghostty-org/ghostty/blob/108cacb17ed8990840cd14abfce43d8ed8503ca1/src/termio/Thread.zig (`handleResize`)
+const RESIZE_GATHER: Duration = Duration::from_millis(25);
 
 /// Output the reader thread has read and `feed` has not taken yet.
 #[derive(Default)]
@@ -116,6 +120,8 @@ pub struct Session {
     /// `backlog` holds the child's last output.
     eof: bool,
     size: GridSize,
+    /// When a gathered resize is applied; `None` when the size is current.
+    resize_due: Option<Instant>,
     key_enc: key::Encoder<'static>,
     key_ev: key::Event<'static>,
     mouse_enc: mouse::Encoder<'static>,
@@ -200,6 +206,7 @@ impl Session {
             parsed: 0,
             eof: false,
             size,
+            resize_due: None,
             key_enc: key::Encoder::new().expect("key encoder"),
             key_ev: key::Event::new().expect("key event"),
             mouse_enc: mouse::Encoder::new().expect("mouse encoder"),
@@ -241,17 +248,26 @@ impl Session {
         self.output.room.notify_one();
     }
 
-    /// Resizes terminal and PTY. Returns false when nothing changed.
-    pub fn resize(&mut self, size: GridSize) -> bool {
-        if size == self.size {
-            return false;
+    /// Resizes terminal and PTY to `size`, the latest wanted size, once `RESIZE_GATHER` has
+    /// passed since the first change; returns when to call again with the then latest size,
+    /// or `None` when the size is current.
+    pub fn resize(&mut self, size: GridSize, now: Instant) -> Option<Instant> {
+        if size == self.size && self.resize_due.is_none() {
+            return None;
         }
-        self.size = size;
-        self.shared.grid.set((size.cols, size.rows, size.cell_w, size.cell_h));
-        self.term.resize(size.cols, size.rows, size.cell_w, size.cell_h).expect("terminal resize");
-        // The child may already be gone; its pane closes on the next feed.
-        let _ = self.pty.resize(pty_size(size));
-        true
+        let due = *self.resize_due.get_or_insert(now + RESIZE_GATHER);
+        if now < due {
+            return Some(due);
+        }
+        self.resize_due = None;
+        if size != self.size {
+            self.size = size;
+            self.shared.grid.set((size.cols, size.rows, size.cell_w, size.cell_h));
+            self.term.resize(size.cols, size.rows, size.cell_w, size.cell_h).expect("terminal resize");
+            // The child may already be gone; its pane closes on the next feed.
+            let _ = self.pty.resize(pty_size(size));
+        }
+        None
     }
 
     /// When the program's frame hold (DEC 2026) must end, or `None` when it holds none. A
@@ -706,6 +722,32 @@ mod tests {
             thread::sleep(Duration::from_millis(5));
         }
         assert!(s.hold(Instant::now()).is_some(), "the program can hold again");
+    }
+
+    #[test]
+    fn resizes_within_25_ms_of_the_first_reach_the_terminal_and_child_as_one() {
+        let mut s = started("trap 'printf \"<winch>\"' WINCH; printf ready; while :; do sleep 0.01; done", "ready");
+        let (before, wide, narrow) =
+            (s.term.cols().unwrap(), GridSize::fit(600, 240, 10, 20, 0), GridSize::fit(500, 240, 10, 20, 0));
+        let t0 = Instant::now();
+        let due = t0 + Duration::from_millis(25);
+        assert_eq!(s.resize(wide, t0), Some(due), "waits for more");
+        assert_eq!(s.term.cols().unwrap(), before);
+        assert_eq!(s.resize(narrow, t0 + Duration::from_millis(20)), Some(due), "later ones do not extend the wait");
+        let settle = |s: &mut Session| {
+            let end = Instant::now() + Duration::from_millis(300);
+            while Instant::now() < end {
+                s.feed(1 << 20);
+                thread::sleep(Duration::from_millis(5));
+            }
+        };
+        settle(&mut s);
+        assert_eq!(s.screen_text().matches("<winch>").count(), 0, "the child waits too: {:?}", s.screen_text());
+        assert_eq!(s.resize(narrow, due), None, "the last size is applied once the wait is over");
+        assert_eq!(s.term.cols().unwrap(), narrow.cols);
+        assert_eq!(s.resize(narrow, due + Duration::from_millis(1)), None, "unchanged: nothing to do");
+        settle(&mut s);
+        assert_eq!(s.screen_text().matches("<winch>").count(), 1, "{:?}", s.screen_text());
     }
 
     #[test]
