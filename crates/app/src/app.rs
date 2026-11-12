@@ -41,8 +41,6 @@ use crate::{Cfg, unescape};
 /// Upper bound on PTY bytes parsed per pane per wake-up, so one flooding pane cannot starve
 /// input handling or the other panes.
 const FEED_BUDGET: usize = 1 << 20;
-/// DEC 2026: the longest a pane may hold its frame (libghostty-vt has no clock).
-const HOLD_LIMIT: Duration = Duration::from_secs(1);
 
 // Sizes in logical pixels.
 const WINDOW: (f64, f64) = (1200.0, 800.0);
@@ -60,18 +58,6 @@ struct Pane {
     title: String,
     /// An OSC 9/777 notification arrived while the pane was not focused.
     attention: bool,
-    hold_since: Option<Instant>,
-}
-
-impl Pane {
-    /// True while the child holds its output under DEC 2026 synchronized output.
-    fn held(&mut self) -> bool {
-        if !self.session.shared.render_hold.get() {
-            self.hold_since = None;
-            return false;
-        }
-        self.hold_since.get_or_insert_with(Instant::now).elapsed() < HOLD_LIMIT
-    }
 }
 
 /// The root window and everything that depends on its scale factor.
@@ -133,6 +119,8 @@ pub struct App {
     shot: Option<String>,
     start: Instant,
     script_next: usize,
+    /// The earliest deadline of a frame hold (DEC 2026) among the panes last drawn.
+    hold_end: Option<Instant>,
 }
 
 impl App {
@@ -159,6 +147,7 @@ impl App {
             shot: None,
             start: Instant::now(),
             script_next: 0,
+            hold_end: None,
         }
     }
 
@@ -236,7 +225,7 @@ impl App {
         };
         match Session::spawn(&program, &cwd, self.grid_size(content), move || proxy.wake_up()) {
             Ok(session) => {
-                let pane_state = Pane { session, grid: Grid::new(), title, attention: false, hold_since: None };
+                let pane_state = Pane { session, grid: Grid::new(), title, attention: false };
                 self.panes.insert(pane, pane_state);
                 self.focus(pane);
             }
@@ -386,7 +375,8 @@ impl App {
         let Win { gpu, fonts, atlas, scale, .. } = w;
         let scale = *scale;
         let pad = (GRID_PAD * scale).round();
-        let mut held_any = false;
+        let now = Instant::now();
+        let mut hold_end = None;
         let cursor = gpu.present(shot.as_deref(), |canvas, ctx| {
             render::background(canvas, &scene);
             let mut cursor = None;
@@ -397,10 +387,10 @@ impl App {
                 }
                 let p = panes.get_mut(&f.pane).expect("every placed pane exists");
                 let focused = Some(f.pane) == focus;
-                let held = p.held();
-                held_any |= held;
+                let held = p.session.hold(now);
+                hold_end = [hold_end, held].into_iter().flatten().min();
                 let c = SkRect::from_xywh(f.content.x, f.content.y, f.content.w, f.content.h);
-                let look = grid::Look { content: c, pad, focused, cursor: theme::ACCENT, update: !held };
+                let look = grid::Look { content: c, pad, focused, cursor: theme::ACCENT, update: held.is_none() };
                 let at = p.grid.draw(canvas, fonts, atlas, ctx, &p.session.term, &look);
                 if focused {
                     cursor = at;
@@ -448,9 +438,20 @@ impl App {
             w.window.set_title(if title.is_empty() { "Frith" } else { &title });
             self.title = title;
         }
-        if held_any {
-            w.window.request_redraw();
+        self.hold_end = hold_end;
+    }
+
+    /// Wakes the event loop for the next script step and for the earliest frame hold that
+    /// must end (see `Session::hold`); the end of a hold needs a frame even if no output comes.
+    /// Runs in `about_to_wait`, which on macOS follows every redraw, so it sees `hold_end`.
+    fn schedule(&mut self, el: &dyn ActiveEventLoop) {
+        if self.hold_end.is_some_and(|t| t <= Instant::now()) {
+            self.hold_end = None;
+            self.redraw();
         }
+        let step = self.cfg.script.get(self.script_next).map(|s| self.start + Duration::from_secs_f32(s.at));
+        let wake = [step, self.hold_end].into_iter().flatten().min();
+        el.set_control_flow(wake.map_or(ControlFlow::Wait, ControlFlow::WaitUntil));
     }
 
     // ---- pointer -----------------------------------------------------------------------
@@ -767,10 +768,6 @@ impl App {
                 return;
             }
         }
-        el.set_control_flow(match self.cfg.script.get(self.script_next) {
-            Some(s) => ControlFlow::WaitUntil(self.start + Duration::from_secs_f32(s.at)),
-            None => ControlFlow::Wait,
-        });
     }
 
     fn script_step(&mut self, el: &dyn ActiveEventLoop, action: &str, arg: &str) {
@@ -902,6 +899,7 @@ impl ApplicationHandler for App {
     fn about_to_wait(&mut self, el: &dyn ActiveEventLoop) {
         if !el.exiting() && self.win.is_some() {
             self.run_script(el);
+            self.schedule(el);
         }
     }
 

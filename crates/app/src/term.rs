@@ -18,12 +18,14 @@ use std::path::Path;
 use std::rc::Rc;
 use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::thread;
+use std::time::{Duration, Instant};
 
 use libghostty_vt::effect::{
     ClipboardMime, ConformanceLevel, DeviceAttributeFeature, DeviceAttributes, DeviceType, PrimaryDeviceAttributes,
     SecondaryDeviceAttributes,
 };
 use libghostty_vt::key::{self, Key};
+use libghostty_vt::mode::Mode;
 use libghostty_vt::report::SizeReportSize;
 use libghostty_vt::terminal::{ScrollViewport, Terminal};
 use libghostty_vt::{mouse, paste};
@@ -39,6 +41,9 @@ const NAME: &str = "frith";
 /// with the backlog `feed` already took, up to twice this waits unparsed. Counted in bytes,
 /// not reads: a macOS PTY read returns at most 1024 bytes (measured).
 const OUTPUT_CAP: usize = 1 << 20;
+/// The longest a program may hold its frame (DEC 2026); Ghostty's `sync_reset_ms`.
+/// @see https://github.com/ghostty-org/ghostty/blob/108cacb17ed8990840cd14abfce43d8ed8503ca1/src/termio/Thread.zig (`sync_reset_ms`)
+const HOLD_LIMIT: Duration = Duration::from_secs(1);
 
 /// Output the reader thread has read and `feed` has not taken yet.
 #[derive(Default)]
@@ -83,7 +88,8 @@ impl GridSize {
 #[derive(Default)]
 pub struct Shared {
     grid: Cell<(u16, u16, u32, u32)>, // cols, rows, cell_w, cell_h
-    pub render_hold: Cell<bool>,
+    /// When the program's current frame hold (DEC 2026) began; read through `Session::hold`.
+    render_hold: Cell<Option<Instant>>,
     pub title_changed: Cell<bool>,
     /// Set by OSC 9 / OSC 777 desktop notifications.
     pub notified: Cell<bool>,
@@ -246,6 +252,21 @@ impl Session {
         // The child may already be gone; its pane closes on the next feed.
         let _ = self.pty.resize(pty_size(size));
         true
+    }
+
+    /// When the program's frame hold (DEC 2026) must end, or `None` when it holds none. A
+    /// hold that has lasted `HOLD_LIMIT` by `now` ends here: the terminal has no clock, so a
+    /// program that never releases its hold would otherwise freeze the pane, and resetting
+    /// the mode lets its next hold begin.
+    /// @see https://github.com/ghostty-org/ghostty/blob/108cacb17ed8990840cd14abfce43d8ed8503ca1/include/ghostty/vt/terminal.h (`GhosttyTerminalRenderHoldFn`)
+    pub fn hold(&mut self, now: Instant) -> Option<Instant> {
+        let deadline = self.shared.render_hold.get()? + HOLD_LIMIT;
+        if now < deadline {
+            return Some(deadline);
+        }
+        self.term.set_mode(Mode::SYNC_OUTPUT, false).expect("set mode 2026");
+        self.shared.render_hold.set(None);
+        None
     }
 
     /// Queues `data` for the child; never blocks. Input to a child that is gone is dropped.
@@ -429,7 +450,8 @@ fn make_terminal(size: GridSize, input: mpsc::Sender<Vec<u8>>, shared: Rc<Shared
     .unwrap();
 
     let s = shared.clone();
-    t.on_render_hold(move |_t, hold| s.render_hold.set(hold)).unwrap();
+    // Timed from here, the moment the hold begins, not from when a frame is next drawn.
+    t.on_render_hold(move |_t, hold| s.render_hold.set(hold.then(Instant::now))).unwrap();
     let s = shared.clone();
     t.on_title_changed(move |_t| s.title_changed.set(true)).unwrap();
     let s = shared;
@@ -566,7 +588,6 @@ fn map_key(code: KeyCode) -> Option<Key> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::{Duration, Instant};
 
     fn run(line: &str) -> Session {
         let size = GridSize::fit(800, 240, 10, 20, 0);
@@ -659,6 +680,32 @@ mod tests {
     fn output_is_parsed_into_the_screen_including_styles_and_wide_characters() {
         let s = run(r"printf 'hello \033[1;31m世界\033[0m!'");
         assert!(s.screen_text().contains("hello 世界!"), "{:?}", s.screen_text());
+    }
+
+    #[test]
+    fn a_frame_hold_is_timed_from_its_own_start_and_a_timed_out_hold_lets_the_next_one_begin() {
+        let line = r"printf '\033[?2026hA'; sleep 0.3; printf '\033[?2026l\033[?2026hB'; read x; printf '\033[?2026hC'; sleep 3";
+        let mut s = started(line, "A");
+        let first = s.hold(Instant::now()).expect("A is held");
+        let wait = Instant::now() + Duration::from_secs(5);
+        while !s.screen_text().contains('B') {
+            assert!(Instant::now() < wait, "no B: {:?}", s.screen_text());
+            s.feed(1 << 20);
+            thread::sleep(Duration::from_millis(5));
+        }
+        let deadline = s.hold(Instant::now()).expect("B is held");
+        assert!(deadline >= first + Duration::from_millis(300), "timed from the second hold, not the first");
+        assert!(deadline <= Instant::now() + HOLD_LIMIT);
+        assert_eq!(s.hold(deadline), None, "a hold ends at its deadline");
+        assert!(!s.term.mode(Mode::SYNC_OUTPUT).unwrap(), "and the mode is reset, as the terminal has no clock");
+        s.write(b"\n");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !s.screen_text().contains('C') {
+            assert!(Instant::now() < deadline, "no C: {:?}", s.screen_text());
+            s.feed(1 << 20);
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(s.hold(Instant::now()).is_some(), "the program can hold again");
     }
 
     #[test]
