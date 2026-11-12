@@ -14,7 +14,7 @@ pub struct Metrics {
     /// Height of the top bar holding the window controls and app buttons.
     pub top: f32,
     pub sidebar: f32,
-    /// Height of the dock bar at the bottom.
+    /// Height of the dock bar at the bottom, while it holds a minimized pane.
     pub bar: f32,
     /// Line between neighboring tiles.
     pub gap: f32,
@@ -138,7 +138,10 @@ pub enum Hit {
 
 pub fn scene(layout: &Layout, width: f32, height: f32, sidebar: bool, m: &Metrics) -> Scene {
     let top = Rect::new(0.0, 0.0, width, m.top);
-    let bar = Rect::new(0.0, height - m.bar, width, m.bar);
+    // The dock bar takes room only while it holds a minimized pane (ADR 14).
+    let docked = layout.docked();
+    let bar_h = if docked.is_empty() { 0.0 } else { m.bar };
+    let bar = Rect::new(0.0, height - bar_h, width, bar_h);
     let body = Rect::new(0.0, top.bottom(), width, (bar.y - top.bottom()).max(0.0));
     let (sidebar, area) = if sidebar {
         let w = m.sidebar.min(body.w);
@@ -154,7 +157,7 @@ pub fn scene(layout: &Layout, width: f32, height: f32, sidebar: bool, m: &Metric
     ];
     let cards = layout.floats(area).into_iter().map(|(pane, outer)| card(pane, outer, m)).collect();
     let inset = ((bar.h - m.button) / 2.0).round();
-    let chips = (layout.docked().into_iter().enumerate())
+    let chips = (docked.into_iter().enumerate())
         .map(|(i, pane)| {
             (pane, Rect::new(bar.x + m.pad + i as f32 * (m.chip + inset), bar.y + inset, m.chip, m.button))
         })
@@ -398,7 +401,7 @@ mod tests {
     #[test]
     fn guides_at_the_middle_of_each_area_edge_dock_to_the_whole_window() {
         let l = two_and_a_card();
-        let s = scene(&l, 800.0, 600.0, false, &m()); // area (0, 30, 800, 540)
+        let s = scene(&l, 800.0, 570.0, false, &m()); // area (0, 30, 800, 540)
         let at = |x, y| s.guides(&l, A, Point::new(x, y), None).active;
         assert_eq!(at(24.0, 300.0), Some(Drop::Window(Edge::Left)), "over A itself, still active");
         assert_eq!(at(776.0, 300.0), Some(Drop::Window(Edge::Right)));
@@ -438,7 +441,7 @@ mod tests {
     #[test]
     fn a_narrow_tiles_guides_make_way_for_the_window_guides_and_reach_past_its_edge() {
         let l = narrow_left();
-        let s = scene(&l, 800.0, 600.0, false, &m());
+        let s = scene(&l, 800.0, 570.0, false, &m());
         assert_eq!(s.tiles[0].outer, Rect::new(0.0, 30.0, 120.0, 540.0), "setup");
         let at = |x, y, held| s.guides(&l, C, Point::new(x, y), held).active;
         assert_eq!(at(24.0, 300.0, None), Some(Drop::Window(Edge::Left)), "the window guide stays reachable");
@@ -484,7 +487,7 @@ mod tests {
     #[test]
     fn each_of_the_eight_guides_lands_the_card_exactly_where_its_preview_shows() {
         let l = two_and_a_card(); // area (0, 30, 800, 540): A (0, 30, 400, 540), B (401, 30, 399, 540)
-        let s = scene(&l, 800.0, 600.0, false, &m());
+        let s = scene(&l, 800.0, 570.0, false, &m());
         let c = Point::new(600.5, 300.0); // B's center
         let cases = [
             (Point::new(c.x - STEP, c.y), Drop::Split(B, Edge::Left), Rect::new(401.0, 30.0, 199.0, 540.0)),
@@ -510,7 +513,7 @@ mod tests {
     #[test]
     fn each_guide_lands_a_dragged_tile_exactly_where_its_preview_shows() {
         let l = two_and_a_card(); // A (0, 30, 400, 540), B (401, 30, 399, 540); A leaves, B fills the area
-        let s = scene(&l, 800.0, 600.0, false, &m());
+        let s = scene(&l, 800.0, 570.0, false, &m());
         let c = Point::new(600.5, 300.0); // B's center
         let cases = [
             (Point::new(c.x - STEP, c.y), Drop::Split(B, Edge::Left), Rect::new(0.0, 30.0, 400.0, 540.0)),
@@ -606,8 +609,33 @@ mod tests {
         let f = &narrow.tiles[0];
         let order: Vec<PaneButton> = f.buttons.iter().map(|b| b.0).collect();
         assert_eq!(order, vec![PaneButton::Zoom, PaneButton::Close]);
-        let short = scene(&one(), 800.0, 30.0 + 30.0 + 15.0, false, &m());
+        let short = scene(&one(), 800.0, 30.0 + 15.0, false, &m());
         assert_eq!(short.tiles[0].buttons, vec![], "a 15 px header cannot hold an 18 px button");
+    }
+
+    #[test]
+    fn the_dock_bar_shows_only_while_a_pane_is_minimized() {
+        let none = scene(&two_and_a_card(), 800.0, 600.0, false, &m());
+        assert_eq!(none.bar.h, 0.0, "no bar without minimized panes");
+        assert_eq!(none.area.bottom(), 600.0, "tiles reach the window's bottom");
+        let some = scene(&busy(), 800.0, 600.0, false, &m());
+        assert_eq!((some.bar.y, some.bar.h), (570.0, 30.0));
+        assert_eq!(some.area.bottom(), 570.0);
+    }
+
+    #[test]
+    fn a_card_at_the_bottom_moves_up_while_the_dock_bar_shows_and_back_after() {
+        let mut l = one();
+        l.split(A, Edge::Right, B);
+        l.split(A, Edge::Bottom, C);
+        l.float(B, Rect::new(100.0, 300.0, 200.0, 100.0));
+        l.float(C, Rect::new(500.0, 500.0, 200.0, 100.0)); // its bottom is the window's
+        let card = |l: &Layout| scene(l, 800.0, 600.0, false, &m()).cards.iter().find(|f| f.pane == C).unwrap().outer;
+        assert_eq!(card(&l), Rect::new(500.0, 500.0, 200.0, 100.0));
+        l.minimize(B);
+        assert_eq!(card(&l), Rect::new(500.0, 470.0, 200.0, 100.0), "kept above the bar");
+        l.restore(B);
+        assert_eq!(card(&l), Rect::new(500.0, 500.0, 200.0, 100.0), "back where it was");
     }
 
     #[test]
@@ -630,14 +658,14 @@ mod tests {
     }
 
     #[test]
-    fn a_single_tile_fills_the_space_between_top_bar_and_dock_bar() {
-        let s = scene(&one(), 800.0, 600.0, false, &m());
+    fn a_single_tile_fills_the_space_below_the_top_bar() {
+        let s = scene(&one(), 800.0, 570.0, false, &m());
         assert_eq!(s.area, Rect::new(0.0, 30.0, 800.0, 540.0));
         assert_eq!(s.tiles[0].header, Rect::new(0.0, 30.0, 800.0, 24.0));
         assert_eq!(s.tiles[0].content, Rect::new(0.0, 54.0, 800.0, 516.0));
         assert_eq!(s.hit(Point::new(400.0, 10.0)), Hit::DragWindow);
         assert_eq!(s.hit(Point::new(400.0, 40.0)), Hit::Header(A));
         assert_eq!(s.hit(Point::new(400.0, 300.0)), Hit::Content(A));
-        assert_eq!(s.hit(Point::new(400.0, 590.0)), Hit::Nothing, "empty dock bar");
+        assert_eq!(s.hit(Point::new(400.0, 569.0)), Hit::Content(A), "down to the window's bottom");
     }
 }
