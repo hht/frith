@@ -36,6 +36,7 @@ use crate::gpu::Gpu;
 use crate::grid::{self, Grid};
 use crate::pty::Program;
 use crate::render::{self, PaneLook, theme};
+use crate::shell;
 use crate::term::{GridSize, Pad, Session};
 use crate::{Cfg, unescape};
 
@@ -95,6 +96,8 @@ struct Resizing {
 pub struct App {
     cfg: Cfg,
     config: Config,
+    /// Where the shell integration is installed, checked before each shell starts.
+    cache: PathBuf,
     proxy: EventLoopProxy,
     win: Option<Win>,
     sidebar: bool,
@@ -124,10 +127,11 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(cfg: Cfg, config: Config, proxy: EventLoopProxy) -> App {
+    pub fn new(cfg: Cfg, config: Config, cache: PathBuf, proxy: EventLoopProxy) -> App {
         App {
             cfg,
             config,
+            cache,
             proxy,
             win: None,
             sidebar: false,
@@ -237,7 +241,15 @@ impl App {
             Program::LoginShell => "shell".to_string(),
             Program::Command(c) => c.clone(),
         };
-        match Session::spawn(&program, &cwd, self.grid_size(content), &self.config, move || proxy.wake_up()) {
+        // Without it, prompts pile up on resize but everything else works (ADR 11).
+        let integration = match program {
+            Program::LoginShell => shell::install(&self.cache)
+                .inspect_err(|e| eprintln!("frith: shell integration not installed: {e}"))
+                .ok(),
+            Program::Command(_) => None,
+        };
+        let size = self.grid_size(content);
+        match Session::spawn(&program, &cwd, size, &self.config, integration.as_deref(), move || proxy.wake_up()) {
             Ok(session) => {
                 let pane_state = Pane { session, grid: Grid::new(), title, attention: false };
                 self.panes.insert(pane, pane_state);

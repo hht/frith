@@ -54,7 +54,7 @@ pub struct Pty {
 impl Pty {
     /// Starts `program` on a new PTY of `size` in `cwd`, with `env` added to this process's
     /// environment.
-    pub fn spawn(program: &Program, size: Size, cwd: &Path, env: &[(&str, &str)]) -> io::Result<Pty> {
+    pub fn spawn(program: &Program, size: Size, cwd: &Path, env: &[(&str, &OsStr)]) -> io::Result<Pty> {
         let _spawning = SPAWN.lock().unwrap_or_else(|e| e.into_inner());
         let (mut master, mut slave) = (-1, -1);
         let mut ws = winsize(size);
@@ -166,7 +166,7 @@ fn set_cloexec(fd: &OwnedFd) -> io::Result<()> {
 
 /// The user's shell from the password database, which is set even when the app was started
 /// from Finder without a `SHELL` variable.
-fn login_shell() -> io::Result<PathBuf> {
+pub fn login_shell() -> io::Result<PathBuf> {
     let mut pw: libc::passwd = unsafe { std::mem::zeroed() };
     let mut buf = vec![0 as libc::c_char; 4096];
     let mut out = ptr::null_mut();

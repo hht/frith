@@ -13,6 +13,7 @@
 //! @see https://github.com/ghostty-org/ghostty/blob/108cacb17ed8990840cd14abfce43d8ed8503ca1/src/termio/Exec.zig (`queueWrite`)
 
 use std::cell::Cell;
+use std::ffi::{OsStr, OsString};
 use std::io::{ErrorKind, Read, Write};
 use std::path::Path;
 use std::rc::Rc;
@@ -34,6 +35,7 @@ use winit::event::{ElementState, KeyEvent};
 use winit::keyboard::{Key as WKey, KeyCode, ModifiersState, PhysicalKey};
 
 use crate::pty::{self, Program, Pty};
+use crate::shell;
 use frith_core::config::Config;
 
 pub const TERM: &str = "xterm-256color";
@@ -147,13 +149,15 @@ pub struct Session {
 }
 
 impl Session {
-    /// Starts `program` in `cwd`. `wake` is called from the IO thread whenever output
-    /// arrives or the child exits.
+    /// Starts `program` in `cwd`; a login shell loads the shell integration installed in
+    /// `integration`, when given. `wake` is called from the IO thread whenever output arrives
+    /// or the child exits.
     pub fn spawn(
         program: &Program,
         cwd: &Path,
         size: GridSize,
         config: &Config,
+        integration: Option<&Path>,
         wake: impl Fn() + Send + 'static,
     ) -> std::io::Result<Session> {
         // Apps launched from Finder or launchd carry no LANG; without a UTF-8 LC_CTYPE, zsh's
@@ -162,10 +166,15 @@ impl Session {
         // included) are the user's choice. Unlike Ghostty, which derives LANG from the macOS
         // language settings and also replaces an invalid LANG, this sets a fixed en_US.UTF-8.
         // @see https://github.com/ghostty-org/ghostty/blob/108cacb17ed8990840cd14abfce43d8ed8503ca1/src/os/locale.zig
-        let mut env = vec![("TERM", TERM), ("COLORTERM", "truecolor"), ("TERM_PROGRAM", NAME)];
+        let mut env: Vec<(&str, OsString)> =
+            vec![("TERM", TERM.into()), ("COLORTERM", "truecolor".into()), ("TERM_PROGRAM", NAME.into())];
         if std::env::var_os("LANG").is_none_or(|v| v.is_empty()) {
-            env.push(("LANG", "en_US.UTF-8"));
+            env.push(("LANG", "en_US.UTF-8".into()));
         }
+        if let (Program::LoginShell, Some(dir)) = (program, integration) {
+            env.extend(shell::env(&pty::login_shell()?, dir, std::env::var_os("ZDOTDIR")));
+        }
+        let env: Vec<(&str, &OsStr)> = env.iter().map(|(k, v)| (*k, v.as_os_str())).collect();
         let pty = Pty::spawn(program, pty_size(size), cwd, &env)?;
         let mut reader = pty.reader()?;
         let mut writer = pty.writer()?;
@@ -645,7 +654,8 @@ mod tests {
     fn run(line: &str) -> Session {
         let size = GridSize::fit(800, 240, 10, 20, Pad::default());
         let mut s =
-            Session::spawn(&Program::Command(line.into()), Path::new("/"), size, &Config::default(), || {}).unwrap();
+            Session::spawn(&Program::Command(line.into()), Path::new("/"), size, &Config::default(), None, || {})
+                .unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
         while !s.feed(1 << 20).exited {
             assert!(Instant::now() < deadline, "child did not exit");
@@ -660,7 +670,7 @@ mod tests {
     }
 
     fn started_with(line: &str, marker: &str, size: GridSize, config: &Config) -> Session {
-        let mut s = Session::spawn(&Program::Command(line.into()), Path::new("/"), size, config, || {}).unwrap();
+        let mut s = Session::spawn(&Program::Command(line.into()), Path::new("/"), size, config, None, || {}).unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
         while !s.screen_text().contains(marker) {
             assert!(Instant::now() < deadline, "no {marker:?}: {:?}", s.screen_text());
@@ -701,7 +711,7 @@ mod tests {
         // The child stays alive: its exit would wake the app and hide a stall.
         let line = "head -c 100000 /dev/zero | tr '\\0' a; printf done; sleep 30";
         let mut s =
-            Session::spawn(&Program::Command(line.into()), Path::new("/"), size, &Config::default(), move || {
+            Session::spawn(&Program::Command(line.into()), Path::new("/"), size, &Config::default(), None, move || {
                 w.store(true, Ordering::Release);
             })
             .unwrap();
@@ -854,5 +864,156 @@ mod tests {
         let s = run(r#"printf '%s %s %s' "$TERM" "$TERM_PROGRAM" "$(locale charmap)""#);
         let text = s.screen_text();
         assert!(text.contains("xterm-256color frith UTF-8"), "{text:?}");
+    }
+
+    /// An interactive zsh with Frith's integration, as `Session::spawn` sets it up, but with
+    /// HOME in a scratch directory holding `zshenv` and `zshrc`, so the user's own dotfiles
+    /// stay out of the test. With `zdotdir`, the files sit in a ZDOTDIR of their own, else in
+    /// HOME, as for most users.
+    fn zsh_in(name: &str, zdotdir: bool, zshenv: &str, zshrc: &str) -> Session {
+        let root = crate::shell::tests::scratch(name);
+        let user = if zdotdir { root.join("user") } else { root.clone() };
+        std::fs::create_dir_all(&user).unwrap();
+        std::fs::write(user.join(".zshenv"), zshenv).unwrap();
+        std::fs::write(user.join(".zshrc"), zshrc).unwrap();
+        let dir = crate::shell::install(&root.join("cache")).unwrap();
+        let vars = crate::shell::env(Path::new("/bin/zsh"), &dir, zdotdir.then(|| user.clone().into()));
+        let assigns: Vec<String> = vars.iter().map(|(k, v)| format!("{k}='{}'", v.to_str().unwrap())).collect();
+        // `env -u` keeps a ZDOTDIR of the developer's out of the shell.
+        let line = format!("exec env -u ZDOTDIR HOME='{}' {} /bin/zsh -i", root.display(), assigns.join(" "));
+        let size = GridSize::fit(800, 240, 10, 20, Pad::default());
+        let mut s =
+            Session::spawn(&Program::Command(line), Path::new("/"), size, &Config::default(), None, || {}).unwrap();
+        settle_until(&mut s, |t| t.trim_end().ends_with('>'));
+        s
+    }
+
+    fn settle_until(s: &mut Session, done: impl Fn(&str) -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !done(&s.screen_text()) {
+            assert!(Instant::now() < deadline, "timed out: {:?}", s.screen_text());
+            s.feed(1 << 20);
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// Resizes to each width in turn, letting zsh redraw after each.
+    fn resize_through(s: &mut Session, widths: &[u32]) {
+        for &w in widths {
+            let size = GridSize::fit(w * 10, 240, 10, 20, Pad::default());
+            let now = Instant::now();
+            s.resize(size, now);
+            assert_eq!(s.resize(size, now + RESIZE_GATHER), None);
+            let end = Instant::now() + Duration::from_millis(150);
+            while Instant::now() < end {
+                s.feed(1 << 20);
+                thread::sleep(Duration::from_millis(5));
+            }
+        }
+    }
+
+    /// Like p10k's first line, the prompt's top line fills the width, so a narrower terminal
+    /// wraps it onto two rows while zsh, redrawing, moves up only the one it printed.
+    const FULL_WIDTH_PROMPT: &str = "setopt prompt_subst\nPS1='top${(l:COLUMNS-3::-:)}'$'\\n> '\n";
+
+    #[test]
+    fn resizing_at_a_zsh_prompt_leaves_one_prompt() {
+        let mut s = zsh_in("one-prompt", true, "", FULL_WIDTH_PROMPT);
+        resize_through(&mut s, &[60, 80, 50, 80, 40, 80]);
+        assert_eq!(s.screen_text().matches("top").count(), 1, "{:?}", s.screen_text());
+    }
+
+    #[test]
+    fn a_prompt_rebuilt_by_the_last_precmd_hook_like_p10k_is_still_cleared() {
+        // p10k rebuilds PROMPT in a precmd hook it keeps last, marking it itself when asked
+        // through this global (internal/p10k.zsh, `_p9k_init_params`).
+        let p10k = r#"
+_like_p10k() {
+  if (( ${+__p9k_force_term_shell_integration} )); then
+    PROMPT=$'%{\e]133;A\a%}top${(l:COLUMNS-3::-:)}\n> %{\e]133;B\a%}'
+  else
+    PROMPT=$'top${(l:COLUMNS-3::-:)}\n> '
+  fi
+}
+setopt prompt_subst
+precmd_functions+=(_like_p10k)
+"#;
+        let mut s = zsh_in("like-p10k", true, "", p10k);
+        // After a command, only the marks on the new prompt tell where it starts.
+        s.write(b"echo $((6*7))\r");
+        settle_until(&mut s, |t| t.matches("top").count() == 2 && t.trim_end().ends_with('>'));
+        resize_through(&mut s, &[60, 80, 50, 80]);
+        let t = s.screen_text();
+        assert_eq!((t.matches("top").count(), t.matches("\n42").count()), (2, 1), "{t:?}");
+    }
+
+    #[test]
+    fn command_output_and_earlier_prompts_survive_a_resize() {
+        let mut s = zsh_in("output", true, "", FULL_WIDTH_PROMPT);
+        // Resized while the command still runs, and again at the next prompt.
+        s.write(b"echo $((6*7)); sleep 0.5\r");
+        settle_until(&mut s, |t| t.contains("\n42"));
+        resize_through(&mut s, &[60, 80]);
+        settle_until(&mut s, |t| t.matches("top").count() == 2 && t.trim_end().ends_with('>'));
+        resize_through(&mut s, &[50, 80]);
+        let t = s.screen_text();
+        assert_eq!((t.matches("top").count(), t.matches("\n42").count()), (2, 1), "{t:?}");
+    }
+
+    #[test]
+    fn without_a_zdotdir_the_users_home_files_apply_and_nothing_leaks_to_children() {
+        let rc = "print -r -- \"rc zdotdir=${ZDOTDIR-unset} env=$FROM_USER_ZSHENV child=$(env | grep -c -e ZDOTDIR)\"\nPS1='> '\n";
+        let s = zsh_in("home-files", false, "export FROM_USER_ZSHENV=yes\n", rc);
+        assert!(s.screen_text().contains("rc zdotdir=unset env=yes child=0"), "{:?}", s.screen_text());
+    }
+
+    #[test]
+    fn startup_output_survives_a_resize_even_when_nobody_marks_the_prompt() {
+        // A prompt framework that rebuilds the prompt after our hook and marks nothing: its
+        // prompts may pile up as without integration, but nothing .zshrc printed is lost.
+        let rc = r#"
+print BANNER
+_unmarked() { PROMPT=$'top${(l:COLUMNS-3::-:)}\n> ' }
+setopt prompt_subst
+precmd_functions+=(_unmarked)
+"#;
+        let mut s = zsh_in("banner", false, "", rc);
+        resize_through(&mut s, &[60, 80]);
+        assert!(s.screen_text().contains("BANNER"), "{:?}", s.screen_text());
+    }
+
+    #[test]
+    fn prompts_are_marked_only_where_zsh_expands_percent_escapes() {
+        let rc = "setopt no_prompt_percent\nPS1='> '\n";
+        let mut s = zsh_in("no-percent", false, "", rc);
+        s.write(b"echo hi\r");
+        settle_until(&mut s, |t| t.contains("\nhi"));
+        assert!(!s.screen_text().contains("%{"), "{:?}", s.screen_text());
+    }
+
+    #[test]
+    fn a_login_shell_session_loads_the_integration_it_is_given() {
+        let shell = pty::login_shell().unwrap();
+        if shell.file_name() != Some(std::ffi::OsStr::new("zsh")) {
+            eprintln!("skipped: the login shell {shell:?} is not zsh");
+            return;
+        }
+        // A stand-in for the installed integration that only reports and exits.
+        let dir = crate::shell::tests::scratch("wiring");
+        std::fs::create_dir_all(dir.join("zsh")).unwrap();
+        std::fs::write(dir.join("zsh/.zshenv"), "print -r -- \"wired ${ZDOTDIR:t}\"\nexit\n").unwrap();
+        let size = GridSize::fit(800, 240, 10, 20, Pad::default());
+        let mut s =
+            Session::spawn(&Program::LoginShell, Path::new("/"), size, &Config::default(), Some(&dir), || {}).unwrap();
+        settle_until(&mut s, |t| t.contains("wired"));
+        assert!(s.screen_text().contains("wired zsh"), "{:?}", s.screen_text());
+    }
+
+    #[test]
+    fn the_users_zdotdir_and_zshenv_still_apply() {
+        let rc =
+            "print -r -- \"zdotdir=${ZDOTDIR:t} env=$FROM_USER_ZSHENV saved=${FRITH_ZSH_ZDOTDIR-none}\"\nPS1='> '\n";
+        let s = zsh_in("user-files", true, "export FROM_USER_ZSHENV=yes\n", rc);
+        assert!(s.screen_text().contains("zdotdir=user env=yes saved=none"), "{:?}", s.screen_text());
     }
 }

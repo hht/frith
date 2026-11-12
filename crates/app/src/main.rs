@@ -21,6 +21,7 @@ mod gpu;
 mod grid;
 mod pty;
 mod render;
+mod shell;
 mod sprite;
 mod term;
 
@@ -99,6 +100,6 @@ fn main() {
         eprintln!("frith: {m}");
     }
     let event_loop = EventLoop::new().expect("event loop");
-    let app = app::App::new(Cfg::from_env(), config, event_loop.create_proxy());
+    let app = app::App::new(Cfg::from_env(), config, shell::cache_dir(&home), event_loop.create_proxy());
     event_loop.run_app(app).expect("event loop run");
 }
