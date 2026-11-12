@@ -26,6 +26,7 @@ pub struct Atlas {
     next: (f32, f32),
     slot: (f32, f32),
     ascent: f32,
+    glyph_x: f32,
     /// Bumped whenever the atlas is wiped; slot rects from an older generation are stale.
     generation: u64,
 }
@@ -40,6 +41,7 @@ impl Atlas {
             next: (0.0, 0.0),
             slot: ((fonts.cell_w * 2.0 + PAD * 2.0).ceil(), (fonts.cell_h + PAD * 2.0).ceil()),
             ascent: fonts.ascent,
+            glyph_x: fonts.glyph_x,
             generation: 0,
         }
     }
@@ -49,7 +51,7 @@ impl Atlas {
     }
 
     /// The slot holding `g`, drawing it first if needed. The glyph's origin sits at
-    /// (`PAD`, `PAD` + ascent) inside the slot. A full atlas is wiped and `generation` bumps.
+    /// (`PAD` + glyph_x, `PAD` + ascent) inside the slot. A full atlas is wiped and `generation` bumps.
     pub fn get(&mut self, fonts: &Fonts, g: Glyph) -> Rect {
         if let Some(r) = self.slots.get(&g) {
             return *r;
@@ -74,7 +76,7 @@ impl Atlas {
         if let Some(blob) = b.make() {
             let mut p = Paint::default();
             p.set_color(Color::WHITE).set_anti_alias(true);
-            self.surface.canvas().draw_text_blob(&blob, (r.left + PAD, r.top + PAD + self.ascent), &p);
+            self.surface.canvas().draw_text_blob(&blob, (r.left + PAD + self.glyph_x, r.top + PAD + self.ascent), &p);
         }
         self.slots.insert(g, r);
         self.dirty = true;

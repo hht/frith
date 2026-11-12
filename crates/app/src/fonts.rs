@@ -59,7 +59,10 @@ pub struct Fonts {
     map: HashMap<(char, bool), Option<Glyph>>,
     pub cell_w: f32,
     pub cell_h: f32,
+    /// From the cell's top to the baseline.
     pub ascent: f32,
+    /// Horizontal offset of every glyph from the cell's left edge.
+    pub glyph_x: f32,
 }
 
 impl Fonts {
@@ -89,12 +92,8 @@ impl Fonts {
         typefaces.push((nerd, None));
         let mut fonts = Vec::new();
         let faces = typefaces.into_iter().map(|(tf, bold)| add_face(&mut fonts, tf, bold, size)).collect::<Vec<_>>();
-        let font = &fonts[faces[0].regular];
-        let (_, m) = font.metrics();
-        let cell_h = (m.descent - m.ascent + m.leading).ceil();
-        let cell_w = font.measure_str("M", None).0.round();
-        let ascent = (-m.ascent).round();
-        Fonts { mgr, size, fonts, faces, map: HashMap::new(), cell_w, cell_h, ascent }
+        let Cell { w: cell_w, h: cell_h, ascent, glyph_x } = cell_metrics(&fonts[faces[0].regular]);
+        Fonts { mgr, size, fonts, faces, map: HashMap::new(), cell_w, cell_h, ascent, glyph_x }
     }
 
     /// The glyph that draws `c` in regular or bold, or `None` when no usable font has it.
@@ -134,6 +133,71 @@ impl Fonts {
             return glyph(f.regular);
         }
         f.bold.map(glyph).filter(|g| g.id != 0).unwrap_or_else(|| glyph(f.synthetic_bold))
+    }
+}
+
+/// The cell `Fonts` exposes, in pixels.
+struct Cell {
+    w: f32,
+    h: f32,
+    ascent: f32,
+    glyph_x: f32,
+}
+
+/// The cell for `font` by Ghostty's rules, so the grid matches Ghostty's: the widest
+/// printable ASCII advance and the line height, each rounded, with the face centered in the
+/// rounded cell (vertically on a whole-pixel baseline). Vertical metrics come from the
+/// font's own tables, not the platform's text stack, so they are the same on every platform.
+/// @see Ghostty `src/font/face/coretext.zig` (`getMetrics`) and `src/font/Metrics.zig` (`calc`)
+fn cell_metrics(font: &Font) -> Cell {
+    let (ascent, descent, gap) = table_metrics(&font.typeface(), f64::from(font.size())).unwrap_or_else(|| {
+        // A font without these tables, such as a bitmap font: the platform's metrics, as
+        // Ghostty does.
+        let (_, m) = font.metrics();
+        (f64::from(-m.ascent), f64::from(-m.descent), f64::from(m.leading))
+    });
+    let ascii: String = (32u8..127).map(char::from).collect();
+    let glyphs = font.str_to_glyphs_vec(&ascii);
+    let mut widths = vec![0.0; glyphs.len()];
+    font.get_widths(&glyphs, &mut widths);
+    let face_w = f64::from(widths.iter().fold(0.0f32, |a, &b| a.max(b)));
+    let face_h = ascent - descent + gap;
+    // At least 1 px, as Ghostty's `Metrics.Minimums`.
+    let (cell_w, cell_h) = (face_w.round().max(1.0), face_h.round().max(1.0));
+    let baseline_from_bottom = (gap / 2.0 - descent - (cell_h - face_h) / 2.0).round();
+    // A face wider than the cell keeps only the fraction of its shift, as in Ghostty.
+    let dx = (cell_w - face_w) / 2.0;
+    let glyph_x = if dx < 0.0 { dx - dx.trunc() } else { dx };
+    Cell { w: cell_w as f32, h: cell_h as f32, ascent: (cell_h - baseline_from_bottom) as f32, glyph_x: glyph_x as f32 }
+}
+
+/// Ascent, descent (negative below the baseline) and line gap in pixels at `size`, from the
+/// table Ghostty would choose: OS/2 typo metrics when the font asks for them, else hhea, else
+/// typo, else win metrics. An OS/2 table too short to hold these fields counts as missing,
+/// as Ghostty's parser rejects it. `None` when the font has no usable `hhea` or units per em.
+/// @see https://learn.microsoft.com/en-us/typography/opentype/spec/os2 (field offsets; fsSelection bit 7)
+/// @see https://learn.microsoft.com/en-us/typography/opentype/spec/hhea
+fn table_metrics(tf: &Typeface, size: f64) -> Option<(f64, f64, f64)> {
+    let table = |tag: &[u8; 4]| tf.copy_table_data(u32::from_be_bytes(*tag));
+    let u16_at = |d: &[u8], at: usize| d.get(at..at + 2).map(|b| u16::from_be_bytes([b[0], b[1]]));
+    let i16_at = |d: &[u8], at: usize| u16_at(d, at).map(|v| f64::from(v as i16));
+    let units = tf.units_per_em().filter(|&u| u > 0)?;
+    let per_unit = size / f64::from(units);
+    let scaled = |(a, d, g): (f64, f64, f64)| Some((a * per_unit, d * per_unit, g * per_unit));
+    let hhea = table(b"hhea")?;
+    let from_hhea = (i16_at(&hhea, 4)?, i16_at(&hhea, 6)?, i16_at(&hhea, 8)?);
+    let os2 = table(b"OS/2");
+    let Some(os2) = os2.as_deref().filter(|t| t.len() >= 78) else { return scaled(from_hhea) };
+    let typo = (i16_at(os2, 68)?, i16_at(os2, 70)?, i16_at(os2, 72)?);
+    const USE_TYPO_METRICS: u16 = 1 << 7;
+    if u16_at(os2, 62)? & USE_TYPO_METRICS != 0 {
+        scaled(typo)
+    } else if from_hhea.0 != 0.0 || from_hhea.1 != 0.0 {
+        scaled(from_hhea)
+    } else if typo.0 != 0.0 || typo.1 != 0.0 {
+        scaled(typo)
+    } else {
+        scaled((f64::from(u16_at(os2, 74)?), -f64::from(u16_at(os2, 76)?), 0.0))
     }
 }
 
@@ -201,6 +265,23 @@ mod tests {
     #[test]
     fn ascii_comes_from_the_configured_family() {
         assert_eq!(family(&mut fonts(), 'a').as_deref(), Some("Menlo"));
+    }
+
+    #[test]
+    fn the_cell_and_baseline_match_ghostty() {
+        // Measured on the user's Ghostty screenshot (font-size 12 on a 2x display, so 24 px,
+        // JetBrains Mono): powerline backgrounds 14 px per column and 32 px tall, and glyph
+        // ink 1 px lower in the cell than Frith drew it with a 24 px baseline.
+        let f = Fonts::new(&[], 24.0);
+        assert_eq!((f.cell_w, f.cell_h, f.ascent), (14.0, 32.0, 25.0));
+        // JetBrains Mono advances 600 of 1000 units, 14.4 px: centered in 14 px, 0.2 px left.
+        assert!((f.glyph_x + 0.2).abs() < 1e-4, "{}", f.glyph_x);
+    }
+
+    #[test]
+    fn a_tiny_font_still_has_a_cell_of_at_least_one_pixel() {
+        let f = Fonts::new(&[], 0.1);
+        assert!(f.cell_w >= 1.0 && f.cell_h >= 1.0, "{} x {}", f.cell_w, f.cell_h);
     }
 
     #[test]
