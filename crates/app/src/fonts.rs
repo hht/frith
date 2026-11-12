@@ -3,14 +3,22 @@
 //! Answers: given a character, which typeface and glyph draw it?
 //! Must not know: terminals, layout, or how glyphs are rasterized and cached.
 //!
-//! Lookup order (ADR 5): the configured families that are installed, the bundled Symbols
-//! Nerd Font, then the system's per-character fallback. LastResort is never used: it claims
-//! every code point with placeholder boxes, so once loaded it would shadow every later
-//! fallback (spike problem 9: braille showed as `?` after p10k icons were drawn).
+//! Lookup order (ADR 5, as in Ghostty): the configured families that are installed, the
+//! bundled JetBrains Mono, the bundled Symbols Nerd Font, then the system's per-character
+//! fallback. LastResort is never used: it claims every code point with placeholder boxes, so
+//! once loaded it would shadow every later fallback (spike problem 9: braille showed as `?`
+//! after p10k icons were drawn).
 
 use std::collections::HashMap;
 
-use skia_safe::{Data, Font, FontMgr, FontStyle, GlyphId, Typeface, font::Edging};
+use skia_safe::font_arguments::{VariationPosition, variation_position::Coordinate};
+use skia_safe::{Data, Font, FontArguments, FontMgr, FontStyle, FourByteTag, GlyphId, Typeface, font::Edging};
+
+/// Draws text when no configured family is installed, and characters the configured ones
+/// lack; Ghostty's built-in font. Variable: bold is its `wght` axis at 700, as in Ghostty.
+/// @see https://github.com/JetBrains/JetBrainsMono/releases/tag/v2.304 (`fonts/variable/JetBrainsMono[wght].ttf`)
+/// @see Ghostty `src/font/SharedGridSet.zig` (the embedded `variable` font at `wght` 700)
+static JETBRAINS_MONO: &[u8] = include_bytes!("../../../assets/fonts/JetBrainsMono-Variable.ttf");
 
 /// Icons only, no text glyphs. @see https://github.com/ryanoasis/nerd-fonts/tree/v3.5.1/patched-fonts/NerdFontsSymbolsOnly
 static NERD_SYMBOLS: &[u8] = include_bytes!("../../../assets/fonts/SymbolsNerdFontMono-Regular.ttf");
@@ -21,9 +29,6 @@ const LAST_RESORT: &str = ".LastResort";
 
 /// Languages hinted to the system fallback, so Han characters prefer Simplified Chinese forms.
 const FALLBACK_LANGS: [&str; 3] = ["zh-Hans", "ja", "ko"];
-
-/// Draws text when no configured family is installed (ADR 13).
-const DEFAULT_FAMILY: &str = "Menlo";
 
 /// One typeface of the lookup order, as indices into `Fonts::fonts`.
 struct Face {
@@ -75,11 +80,11 @@ impl Fonts {
                 })
             })
             .collect();
-        if typefaces.is_empty() {
-            let menlo = mgr.match_family_style(DEFAULT_FAMILY, FontStyle::normal()).expect("Menlo ships with macOS");
-            let bold = system_bold(&mgr, &menlo);
-            typefaces.push((menlo, bold));
-        }
+        let jbm = mgr.new_from_data(Data::new_copy(JETBRAINS_MONO), None).expect("bundled JetBrains Mono parses");
+        let wght = [Coordinate { axis: FourByteTag::from_chars('w', 'g', 'h', 't'), value: 700.0 }];
+        let args = FontArguments::new().set_variation_design_position(VariationPosition { coordinates: &wght });
+        let jbm_bold = jbm.clone_with_arguments(&args).expect("JetBrains Mono has a wght axis");
+        typefaces.push((jbm, Some(jbm_bold)));
         let nerd = mgr.new_from_data(Data::new_copy(NERD_SYMBOLS), None).expect("bundled Nerd Font parses");
         typefaces.push((nerd, None));
         let mut fonts = Vec::new();
@@ -208,17 +213,48 @@ mod tests {
     }
 
     #[test]
-    fn without_an_installed_family_menlo_draws_text() {
+    fn without_an_installed_family_the_bundled_jetbrains_mono_draws_text() {
         for families in [&[][..], &["No Such Font"]] {
             let mut f = with(families);
-            assert_eq!(family(&mut f, 'a').as_deref(), Some("Menlo"), "{families:?}");
+            assert_eq!(family(&mut f, 'a').as_deref(), Some("JetBrains Mono"), "{families:?}");
         }
+    }
+
+    fn weight(f: &Fonts, g: Glyph) -> Option<f32> {
+        let wght = skia_safe::FourByteTag::from_chars('w', 'g', 'h', 't');
+        let axes = f.font(g).typeface().variation_design_position()?;
+        axes.iter().find(|c| c.axis == wght).map(|c| c.value)
+    }
+
+    #[test]
+    fn bundled_bold_is_jetbrains_mono_at_weight_700() {
+        let mut f = with(&[]);
+        let (regular, bold) = (f.lookup('a', false).unwrap(), f.lookup('a', true).unwrap());
+        assert_eq!((weight(&f, regular), weight(&f, bold)), (Some(400.0), Some(700.0)));
+        assert_eq!(family(&mut f, 'a').as_deref(), Some("JetBrains Mono"));
+        assert!(!f.font(bold).is_embolden(), "a real weight, not a synthetic one");
+    }
+
+    #[test]
+    fn jetbrains_mono_comes_after_the_configured_families_and_before_the_system() {
+        let (mut menlo, mut jbm) = (fonts(), with(&[]));
+        let only_in_jbm = (0x2000..0x2c00)
+            .filter_map(char::from_u32)
+            .find(|&c| {
+                let m = menlo.lookup(c, false).map(|g| menlo.font(g).typeface().family_name());
+                let j = jbm.lookup(c, false).map(|g| jbm.font(g).typeface().family_name());
+                m.as_deref() != Some("Menlo") && j.as_deref() == Some("JetBrains Mono")
+            })
+            .expect("a character JetBrains Mono has and Menlo lacks");
+        assert_eq!(family(&mut menlo, 'a').as_deref(), Some("Menlo"));
+        assert_eq!(family(&mut menlo, only_in_jbm).as_deref(), Some("JetBrains Mono"), "{only_in_jbm:?}");
     }
 
     #[test]
     fn nerd_icons_come_from_the_bundled_symbols_font() {
         let mut f = fonts();
-        assert_eq!(family(&mut f, '\u{e0a0}').as_deref(), Some("Symbols Nerd Font Mono"), "powerline branch");
+        // JetBrains Mono has the powerline symbols; it comes first, as in Ghostty.
+        assert_eq!(family(&mut f, '\u{e0a0}').as_deref(), Some("JetBrains Mono"), "powerline branch");
         assert_eq!(family(&mut f, '\u{f07b}').as_deref(), Some("Symbols Nerd Font Mono"), "folder icon");
     }
 
