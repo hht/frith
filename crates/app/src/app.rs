@@ -403,12 +403,13 @@ impl App {
         let Win { gpu, fonts, atlas, scale, .. } = w;
         let scale = *scale;
         let cursor = gpu.present(shot.as_deref(), |canvas, ctx| {
-            render::background(canvas, &scene);
+            let mut pen = render::Pen { canvas, fonts, scale };
+            render::background(&pen, &scene);
             let mut cursor = None;
             let zoomed = layout.zoomed();
             for (f, card) in scene.tiles.iter().map(|f| (f, false)).chain(scene.cards.iter().map(|f| (f, true))) {
                 if card {
-                    render::card_under(canvas, f, scale);
+                    render::card_under(&pen, f);
                 }
                 let p = panes.get_mut(&f.pane).expect("every placed pane exists");
                 let focused = Some(f.pane) == focus;
@@ -416,7 +417,7 @@ impl App {
                 frame_due = [frame_due, held].into_iter().flatten().min();
                 let c = SkRect::from_xywh(f.content.x, f.content.y, f.content.w, f.content.h);
                 let look = grid::Look { content: c, pad, focused, cursor: theme::ACCENT, update: held.is_none() };
-                let at = p.grid.draw(canvas, fonts, atlas, ctx, &p.session.term, &look);
+                let at = p.grid.draw(canvas, pen.fonts, atlas, ctx, &p.session.term, &look);
                 if focused {
                     cursor = at;
                 }
@@ -428,25 +429,25 @@ impl App {
                     zoomed: zoomed == Some(f.pane),
                 };
                 if card {
-                    render::card_over(canvas, fonts, f, &look, hover, scale);
+                    render::card_over(&mut pen, f, &look, hover);
                 } else {
-                    render::tile_header(canvas, fonts, f, &look, hover, scale);
+                    render::tile_header(&mut pen, f, &look, hover);
                 }
                 if !card && Some(f) == scene.tiles.last() {
-                    render::dividers(canvas, &scene.dividers, lit);
+                    render::dividers(&pen, &scene.dividers, lit);
                 }
             }
             if scene.tiles.is_empty() {
-                render::empty_state(canvas, fonts, scene.area);
+                render::empty_state(&mut pen, scene.area);
             }
-            render::top_bar(canvas, fonts, &scene, &title, hover, scale);
-            render::dock(canvas, fonts, &scene, |p| (panes[&p].title.clone(), panes[&p].attention), hover, scale);
+            render::top_bar(&mut pen, &scene, &title, hover);
+            render::dock(&mut pen, &scene, |p| (panes[&p].title.clone(), panes[&p].attention), hover);
             if let Some((guides, preview)) = &guides {
                 let preview = preview.as_ref().map(|(zone, text)| (*zone, text.as_str()));
-                render::dock_guides(canvas, fonts, &scene, guides, preview, pointer, scale);
+                render::dock_guides(&mut pen, &scene, guides, preview, pointer);
             }
             if let Some(c) = cursor {
-                render::preedit(canvas, fonts, c, preedit);
+                render::preedit(&mut pen, c, preedit);
             }
             cursor
         });
