@@ -32,7 +32,7 @@ use winit::window::{
 };
 
 use crate::atlas::Atlas;
-use crate::fonts::Fonts;
+use crate::fonts::{self, Fonts};
 use crate::gpu::Gpu;
 use crate::grid::{self, Grid};
 use crate::pty::Program;
@@ -47,6 +47,9 @@ const FEED_BUDGET: usize = 1 << 20;
 
 // Sizes in logical pixels.
 const WINDOW: (f64, f64) = (1200.0, 800.0);
+/// Chrome text size in points: macOS's Callout style, a step below its 13 pt Body.
+/// @see https://developer.apple.com/design/human-interface-guidelines/typography#macOS-built-in-text-styles
+const UI_TEXT: f32 = 12.0;
 /// Pointer travel that turns a header press into a pane drag.
 const DRAG_THRESHOLD: f32 = 4.0;
 const MIN_TILE: f32 = 80.0;
@@ -65,6 +68,8 @@ struct Win {
     window: Box<dyn Window>,
     gpu: Gpu,
     fonts: Fonts,
+    /// The system UI font at `UI_TEXT` pt, for chrome text.
+    ui: skia_safe::Font,
     atlas: Atlas,
     metrics: Metrics,
     scale: f32,
@@ -217,9 +222,10 @@ impl App {
         let size = window.surface_size();
         let fonts = Fonts::new(&self.config.font_family, self.config.font_size * scale);
         let atlas = Atlas::new(&fonts);
+        let ui = fonts::ui_font(UI_TEXT * scale);
         window.request_redraw();
         let metrics = Metrics::for_scale(scale);
-        self.win = Some(Win { window, gpu, fonts, atlas, metrics, scale, size: (size.width, size.height) });
+        self.win = Some(Win { window, gpu, fonts, ui, atlas, metrics, scale, size: (size.width, size.height) });
     }
 
     fn rescale(&mut self, scale: f32) {
@@ -228,6 +234,7 @@ impl App {
         w.metrics = Metrics::for_scale(scale);
         w.fonts = Fonts::new(&self.config.font_family, self.config.font_size * scale);
         w.atlas = Atlas::new(&w.fonts);
+        w.ui = fonts::ui_font(UI_TEXT * scale);
         for p in self.panes.values_mut() {
             p.grid.invalidate();
         }
@@ -410,10 +417,10 @@ impl App {
         let layout = &*layout;
         let (focus, hover, pointer) = (*focus, *hover, *pointer);
         let w = win.as_mut().expect("window");
-        let Win { gpu, fonts, atlas, scale, .. } = w;
+        let Win { gpu, fonts, ui, atlas, scale, .. } = w;
         let scale = *scale;
         let cursor = gpu.present(shot.as_deref(), |canvas, ctx| {
-            let mut pen = render::Pen { canvas, chrome, fonts, scale };
+            let mut pen = render::Pen { canvas, chrome, ui, fonts, scale };
             render::background(&pen, &scene);
             let mut cursor = None;
             let zoomed = layout.zoomed();

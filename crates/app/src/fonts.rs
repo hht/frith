@@ -27,6 +27,10 @@ static NERD_SYMBOLS: &[u8] = include_bytes!("../../../assets/fonts/SymbolsNerdFo
 /// leading dot of hidden system fonts (observed on macOS 26.5).
 const LAST_RESORT: &str = ".LastResort";
 
+/// The system UI font's family on macOS: it resolves to SF (observed on macOS 26.5), while
+/// Skia's default typeface without a name is Helvetica.
+const UI_FAMILY: &str = ".AppleSystemUIFont";
+
 /// Languages hinted to the system fallback, so Han characters prefer Simplified Chinese forms.
 const FALLBACK_LANGS: [&str; 3] = ["zh-Hans", "ja", "ko"];
 
@@ -138,6 +142,17 @@ impl Fonts {
         }
         f.bold.map(glyph).filter(|g| g.id != 0).unwrap_or_else(|| glyph(f.synthetic_bold))
     }
+}
+
+/// The system's UI font at `size` pixels, for chrome text (ADR 14). Characters it lacks
+/// fall back to the terminal's lookup order.
+pub fn ui_font(size: f32) -> Font {
+    let mgr = FontMgr::new();
+    let tf = mgr
+        .match_family_style(UI_FAMILY, FontStyle::normal())
+        .or_else(|| mgr.legacy_make_typeface(None, FontStyle::normal()))
+        .expect("the system has a default typeface");
+    font(tf, size, false)
 }
 
 /// The cell `Fonts` exposes, in pixels.
@@ -298,6 +313,14 @@ mod tests {
         assert_eq!((f.cell_w, f.cell_h, f.ascent), (14.0, 32.0, 25.0));
         // JetBrains Mono advances 600 of 1000 units, 14.4 px: centered in 14 px, 0.2 px left.
         assert!((f.glyph_x + 0.2).abs() < 1e-4, "{}", f.glyph_x);
+    }
+
+    #[test]
+    fn chrome_text_uses_the_system_ui_font_not_skias_default() {
+        let f = ui_font(24.0);
+        // SF's PostScript name; without a family name Skia falls back to Helvetica.
+        assert_eq!(f.typeface().post_script_name().as_deref(), Some(".SFNS-Regular"));
+        assert_eq!(f.size(), 24.0);
     }
 
     #[test]

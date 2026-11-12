@@ -15,7 +15,8 @@ use frith_core::geom::{Point, Rect};
 use frith_core::layout::{Divider, Drop, Edge, PaneId};
 use frith_core::scene::{ChromeButton, Frame, Guides, Hit, PaneButton, Scene};
 use skia_safe::{
-    BlendMode, Canvas, ClipOp, Color, MaskFilter, Paint, PaintStyle, RRect, Rect as SkRect, TextBlobBuilder,
+    BlendMode, Canvas, ClipOp, Color, Font, GlyphId, MaskFilter, Paint, PaintStyle, RRect, Rect as SkRect,
+    TextBlobBuilder,
 };
 
 use crate::fonts::{Fonts, Glyph};
@@ -37,6 +38,8 @@ fn sk(r: Rect) -> SkRect {
 pub struct Pen<'a> {
     pub canvas: &'a Canvas,
     pub chrome: &'a Chrome,
+    /// The system UI font, for chrome text (ADR 14).
+    pub ui: &'a Font,
     pub fonts: &'a mut Fonts,
     /// Physical pixels per logical pixel.
     pub scale: f32,
@@ -71,7 +74,6 @@ pub fn background(pen: &Pen, scene: &Scene) {
 pub fn top_bar(pen: &mut Pen, scene: &Scene, title: &str, hover: Hit) {
     let c = pen.chrome;
     let (canvas, scale) = (pen.canvas, pen.scale);
-    let fonts = &mut *pen.fonts;
     for &(b, r) in &scene.chrome {
         button_back(canvas, c, r, hover == Hit::Chrome(b));
         let mut p = stroke(col(c.text_dim), scale);
@@ -89,9 +91,9 @@ pub fn top_bar(pen: &mut Pen, scene: &Scene, title: &str, hover: Hit) {
             }
         }
     }
-    let w = text_width(fonts, title).min(scene.top.w / 2.0);
+    let w = ui_width(pen, title).min(scene.top.w / 2.0);
     let x = (scene.top.x + (scene.top.w - w) / 2.0).round();
-    label(canvas, fonts, title, x, scene.top, w, col(c.text_dim));
+    ui_text(pen, title, x, scene.top, w, col(c.text_dim));
 }
 
 /// A tile's header strip (the grid is drawn separately), with buttons only while the pane
@@ -131,12 +133,11 @@ pub fn dividers(pen: &Pen, dividers: &[Divider], lit: Option<usize>) {
 /// Shown when every pane floats or is minimized (ADR 6).
 pub fn empty_state(pen: &mut Pen, area: Rect) {
     let c = pen.chrome;
-    let canvas = pen.canvas;
-    let fonts = &mut *pen.fonts;
     let text = "No tiled panes. Drag a card to an edge, or press ⌘D.";
-    let w = text_width(fonts, text).min(area.w);
-    let line = Rect::new(area.x, area.y + area.h / 2.0 - fonts.cell_h, area.w, fonts.cell_h * 2.0);
-    label(canvas, fonts, text, (area.x + (area.w - w) / 2.0).round(), line, w, col(c.text_dim));
+    let w = ui_width(pen, text).min(area.w);
+    let h = ui_line(pen.ui);
+    let line = Rect::new(area.x, area.y + area.h / 2.0 - h, area.w, h * 2.0);
+    ui_text(pen, text, (area.x + (area.w - w) / 2.0).round(), line, w, col(c.text_dim));
 }
 
 /// Card radius in physical pixels.
@@ -176,7 +177,6 @@ pub fn card_over(pen: &mut Pen, f: &Frame, look: &PaneLook, hover: Hit) {
 fn header_content(pen: &mut Pen, f: &Frame, look: &PaneLook, hover: Hit, buttons: bool) {
     let c = pen.chrome;
     let (canvas, scale) = (pen.canvas, pen.scale);
-    let fonts = &mut *pen.fonts;
     let inset = (6.0 * scale).round();
     let mut x = f.header.x + inset;
     if look.attention {
@@ -188,7 +188,7 @@ fn header_content(pen: &mut Pen, f: &Frame, look: &PaneLook, hover: Hit, buttons
     }
     let right = if buttons { f.buttons.first().map_or(f.header.right(), |(_, r)| r.x) } else { f.header.right() };
     let ink = if look.focused { col(c.text) } else { col(c.text_dim) };
-    label(canvas, fonts, look.title, x, f.header, right - inset - x, ink);
+    ui_text(pen, look.title, x, f.header, right - inset - x, ink);
     if !buttons {
         return;
     }
@@ -263,7 +263,6 @@ fn icon(canvas: &Canvas, b: PaneButton, r: Rect, zoomed: bool, ink: Color, scale
 pub fn dock(pen: &mut Pen, scene: &Scene, look: impl Fn(PaneId) -> (String, bool), hover: Hit) {
     let c = pen.chrome;
     let (canvas, scale) = (pen.canvas, pen.scale);
-    let fonts = &mut *pen.fonts;
     let mut p = Paint::default();
     p.set_anti_alias(true);
     for &(pane, r) in &scene.chips {
@@ -278,7 +277,7 @@ pub fn dock(pen: &mut Pen, scene: &Scene, look: impl Fn(PaneId) -> (String, bool
             canvas.draw_circle((x + d, r.y + r.h / 2.0), d, &p);
             x += d * 3.0;
         }
-        label(canvas, fonts, &title, x, r, r.right() - rad - x, col(c.text));
+        ui_text(pen, &title, x, r, r.right() - rad - x, col(c.text));
     }
 }
 
@@ -289,7 +288,6 @@ pub fn dock(pen: &mut Pen, scene: &Scene, look: impl Fn(PaneId) -> (String, bool
 pub fn dock_guides(pen: &mut Pen, scene: &Scene, guides: &Guides, preview: Option<(Rect, &str)>, at: Point) {
     let c = pen.chrome;
     let (canvas, scale) = (pen.canvas, pen.scale);
-    let fonts = &mut *pen.fonts;
     if let Some(f) = guides.target.and_then(|t| scene.tiles.iter().find(|f| f.pane == t)) {
         let o = f.outer;
         let inset = scale;
@@ -310,8 +308,8 @@ pub fn dock_guides(pen: &mut Pen, scene: &Scene, guides: &Guides, preview: Optio
     let Some((_, text)) = preview else { return };
     let bounds = Rect::new(0.0, 0.0, scene.top.w, scene.bar.bottom());
     let pad = 8.0 * scale;
-    let h = fonts.cell_h + pad;
-    let (w, off) = (text_width(fonts, text) + 2.0 * pad, 14.0 * scale);
+    let h = ui_line(pen.ui) + pad;
+    let (w, off) = (ui_width(pen, text) + 2.0 * pad, 14.0 * scale);
     let x = if at.x + off + w <= bounds.right() { at.x + off } else { at.x - off - w };
     let y = if at.y + off + h <= bounds.bottom() { at.y + off } else { at.y - off - h };
     let r = Rect::new(x, y, w, h);
@@ -319,7 +317,7 @@ pub fn dock_guides(pen: &mut Pen, scene: &Scene, guides: &Guides, preview: Optio
     back.set_anti_alias(true).set_color(col(c.raised));
     canvas.draw_round_rect(sk(r), h / 2.0, h / 2.0, &back);
     canvas.draw_round_rect(sk(r), h / 2.0, h / 2.0, &stroke(col(c.accent), scale));
-    label(canvas, fonts, text, r.x + pad, r, r.w - pad, col(c.text));
+    ui_text(pen, text, r.x + pad, r, r.w - pad, col(c.text));
 }
 
 /// One guide: a rounded square holding a small pane outline with the part the dragged pane
@@ -365,7 +363,7 @@ pub fn preedit(pen: &mut Pen, at: SkRect, text: &str) {
     let mut p = Paint::default();
     p.set_color(col(c.header_focused));
     canvas.draw_rect(sk(r), &p);
-    label(canvas, fonts, text, r.x, r, f32::INFINITY, col(c.text));
+    cell_text(canvas, fonts, text, r.x, r, col(c.text));
     p.set_color(col(c.accent));
     canvas.draw_rect(SkRect::from_xywh(r.x, r.bottom() - 2.0, r.w, 2.0), &p);
 }
@@ -379,31 +377,13 @@ fn text_width(fonts: &Fonts, text: &str) -> f32 {
     text.chars().filter(|c| !c.is_control()).map(cells).sum::<f32>() * fonts.cell_w
 }
 
-/// Single-line text vertically centered in `line`, starting at `x`, cut with "…" to fit
-/// `max_w`. Monospace advances with per-character font fallback, like the grid.
-fn label(canvas: &Canvas, fonts: &mut Fonts, text: &str, x: f32, line: Rect, max_w: f32, ink: Color) {
-    let cw = fonts.cell_w;
-    let mut chars: Vec<char> = Vec::new();
-    let mut used = 0.0;
-    for c in text.chars().filter(|c| !c.is_control()) {
-        if used + cells(c) * cw > max_w {
-            while used + cw > max_w {
-                match chars.pop() {
-                    Some(last) => used -= cells(last) * cw,
-                    None => return,
-                }
-            }
-            chars.push('…');
-            break;
-        }
-        used += cells(c) * cw;
-        chars.push(c);
-    }
+/// Text in the terminal's cells, as the grid draws it, with its baseline centered in `line`.
+fn cell_text(canvas: &Canvas, fonts: &mut Fonts, text: &str, x: f32, line: Rect, ink: Color) {
     let baseline = line.y + ((line.h - fonts.cell_h) / 2.0).round() + fonts.ascent;
     // Runs of glyphs from one font, each keyed by its first glyph.
-    let mut runs: Vec<(Glyph, Vec<skia_safe::GlyphId>, Vec<f32>)> = Vec::new();
+    let mut runs: Vec<(Glyph, Vec<GlyphId>, Vec<f32>)> = Vec::new();
     let mut pen = x;
-    for c in chars {
+    for c in text.chars().filter(|c| !c.is_control()) {
         if let Some(g) = fonts.lookup(c, false) {
             match runs.last_mut() {
                 Some((first, gs, xs)) if first.font == g.font => {
@@ -413,7 +393,7 @@ fn label(canvas: &Canvas, fonts: &mut Fonts, text: &str, x: f32, line: Rect, max
                 _ => runs.push((g, vec![g.id], vec![pen])),
             }
         }
-        pen += cells(c) * cw;
+        pen += cells(c) * fonts.cell_w;
     }
     let mut b = TextBlobBuilder::new();
     for (first, gs, xs) in &runs {
@@ -421,6 +401,95 @@ fn label(canvas: &Canvas, fonts: &mut Fonts, text: &str, x: f32, line: Rect, max
         g2.copy_from_slice(gs);
         x2.copy_from_slice(xs);
     }
+    draw_blob(canvas, b, ink);
+}
+
+/// One glyph of chrome text: the font that draws it (the UI font, or a terminal font for a
+/// character the UI font lacks), its id, and its advance.
+type UiGlyph = (Option<Glyph>, GlyphId, f32);
+
+/// The glyphs of `text` in the UI font, characters it lacks taken from the terminal's lookup
+/// order at the UI font's size.
+fn ui_glyphs(ui: &Font, fonts: &mut Fonts, text: &str) -> Vec<UiGlyph> {
+    let mut out = Vec::new();
+    for c in text.chars().filter(|c| !c.is_control()) {
+        let id = ui.unichar_to_glyph(c as i32);
+        if id != 0 {
+            out.push((None, id, advance(ui, id)));
+        } else if let Some(g) = fonts.lookup(c, false) {
+            out.push((Some(g), g.id, advance(&sized(fonts, g, ui), g.id)));
+        }
+    }
+    out
+}
+
+fn sized(fonts: &Fonts, g: Glyph, ui: &Font) -> Font {
+    let mut f = fonts.font(g).clone();
+    f.set_size(ui.size());
+    f
+}
+
+fn advance(font: &Font, id: GlyphId) -> f32 {
+    let mut w = [0.0];
+    font.get_widths(&[id], &mut w);
+    w[0]
+}
+
+/// The width chrome text takes in the UI font.
+fn ui_width(pen: &mut Pen, text: &str) -> f32 {
+    ui_glyphs(pen.ui, pen.fonts, text).iter().map(|g| g.2).sum()
+}
+
+/// The height of a line of chrome text.
+fn ui_line(ui: &Font) -> f32 {
+    let (_, m) = ui.metrics();
+    (m.descent - m.ascent).ceil()
+}
+
+/// Chrome text in the UI font from `x`, its baseline centered in `line` on a whole pixel,
+/// cut with "…" to fit `max_w`.
+fn ui_text(pen: &mut Pen, text: &str, x: f32, line: Rect, max_w: f32, ink: Color) {
+    let (canvas, ui) = (pen.canvas, pen.ui);
+    let mut glyphs = ui_glyphs(ui, pen.fonts, text);
+    let total: f32 = glyphs.iter().map(|g| g.2).sum();
+    if total > max_w {
+        let dots = ui.unichar_to_glyph('…' as i32);
+        let dots = (None, dots, advance(ui, dots));
+        let mut used = total;
+        while used + dots.2 > max_w {
+            match glyphs.pop() {
+                Some(g) => used -= g.2,
+                None => return,
+            }
+        }
+        glyphs.push(dots);
+    }
+    let (_, m) = ui.metrics();
+    let baseline = (line.y + (line.h - (m.descent - m.ascent)) / 2.0 - m.ascent).round();
+    // Runs of glyphs from one font.
+    let mut runs: Vec<(Option<Glyph>, Vec<GlyphId>, Vec<f32>)> = Vec::new();
+    let mut at = x;
+    for (src, id, adv) in glyphs {
+        match runs.last_mut() {
+            Some((first, ids, xs)) if first.map(|g| g.font) == src.map(|g| g.font) => {
+                ids.push(id);
+                xs.push(at);
+            }
+            _ => runs.push((src, vec![id], vec![at])),
+        }
+        at += adv;
+    }
+    let mut b = TextBlobBuilder::new();
+    for (src, ids, xs) in &runs {
+        let font = src.map_or_else(|| ui.clone(), |g| sized(pen.fonts, g, ui));
+        let (g2, x2) = b.alloc_run_pos_h(&font, ids.len(), baseline, None);
+        g2.copy_from_slice(ids);
+        x2.copy_from_slice(xs);
+    }
+    draw_blob(canvas, b, ink);
+}
+
+fn draw_blob(canvas: &Canvas, mut b: TextBlobBuilder, ink: Color) {
     if let Some(blob) = b.make() {
         let mut p = Paint::default();
         p.set_anti_alias(true).set_color(ink);
