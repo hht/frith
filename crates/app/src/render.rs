@@ -70,8 +70,8 @@ pub fn background(pen: &Pen, scene: &Scene) {
     }
 }
 
-/// Top bar: chrome buttons and the focused pane's title, centered.
-pub fn top_bar(pen: &mut Pen, scene: &Scene, title: &str, hover: Hit) {
+/// Top bar: the chrome buttons. Pane titles show only in pane headers (ADR 14).
+pub fn top_bar(pen: &Pen, scene: &Scene, hover: Hit) {
     let c = pen.chrome;
     let (canvas, scale) = (pen.canvas, pen.scale);
     for &(b, hit) in &scene.chrome {
@@ -92,9 +92,6 @@ pub fn top_bar(pen: &mut Pen, scene: &Scene, title: &str, hover: Hit) {
             }
         }
     }
-    let w = ui_width(pen, title).min(scene.top.w / 2.0);
-    let x = (scene.top.x + (scene.top.w - w) / 2.0).round();
-    ui_text(pen, title, x, scene.top, w, col(c.text_dim));
 }
 
 /// A tile's header strip (the grid is drawn separately), with buttons only while the pane

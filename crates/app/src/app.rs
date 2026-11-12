@@ -466,7 +466,7 @@ impl App {
             if scene.tiles.is_empty() {
                 render::empty_state(&mut pen, scene.area);
             }
-            render::top_bar(&mut pen, &scene, &title, hover);
+            render::top_bar(&pen, &scene, hover);
             render::dock(&mut pen, &scene, |p| (panes[&p].title.clone(), panes[&p].attention), hover);
             if let Some((guides, preview)) = &guides {
                 let preview = preview.as_ref().map(|(zone, text)| (*zone, text.as_str()));
