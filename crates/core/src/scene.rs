@@ -19,7 +19,13 @@ pub struct Metrics {
     /// Line between neighboring tiles.
     pub gap: f32,
     pub header: f32,
+    /// Side of a header button, small enough to leave the header's top and bottom edges to
+    /// divider and resize bands.
     pub button: f32,
+    /// The smallest hit target (WCAG 2.5.8): top bar buttons and dock chips are this big;
+    /// header buttons, smaller, sit this far apart, which the criterion's spacing exception
+    /// accepts. @see https://www.w3.org/TR/WCAG22/#target-size-minimum
+    pub target: f32,
     /// Width the system window controls (traffic lights) take at the left of the top bar.
     pub controls: f32,
     /// Inset of top bar buttons and dock chips from the window edge.
@@ -44,6 +50,7 @@ impl Metrics {
             gap: px(1.0),
             header: px(24.0),
             button: px(18.0),
+            target: px(24.0),
             controls: px(78.0),
             pad: px(8.0),
             chip: px(160.0),
@@ -150,17 +157,15 @@ pub fn scene(layout: &Layout, width: f32, height: f32, sidebar: bool, m: &Metric
         (None, body)
     };
     let tiles = layout.tiles(area, m.gap).into_iter().map(|(pane, outer)| tile(pane, outer, m)).collect();
-    let y = top.y + ((top.h - m.button) / 2.0).round();
+    let (t, y) = (m.target, top.y + ((top.h - m.target) / 2.0).round());
     let chrome = vec![
-        (ChromeButton::Sidebar, Rect::new(top.x + m.controls, y, m.button, m.button)),
-        (ChromeButton::Launcher, Rect::new(top.right() - m.pad - m.button, y, m.button, m.button)),
+        (ChromeButton::Sidebar, Rect::new(top.x + m.controls, y, t, t)),
+        (ChromeButton::Launcher, Rect::new(top.right() - m.pad - t, y, t, t)),
     ];
     let cards = layout.floats(area).into_iter().map(|(pane, outer)| card(pane, outer, m)).collect();
-    let inset = ((bar.h - m.button) / 2.0).round();
+    let (gap, y) = (((bar.h - m.button) / 2.0).round(), bar.y + ((bar.h - m.target) / 2.0).round());
     let chips = (docked.into_iter().enumerate())
-        .map(|(i, pane)| {
-            (pane, Rect::new(bar.x + m.pad + i as f32 * (m.chip + inset), bar.y + inset, m.chip, m.button))
-        })
+        .map(|(i, pane)| (pane, Rect::new(bar.x + m.pad + i as f32 * (m.chip + gap), y, m.chip, m.target)))
         .take_while(|(_, r)| r.right() <= bar.right() - m.pad)
         .collect();
     Scene { top, sidebar, area, tiles, bar, chrome, dividers: layout.dividers(area, m.gap), cards, chips, metrics: *m }
@@ -193,7 +198,7 @@ fn frame(pane: PaneId, outer: Rect, buttons: &[PaneButton], m: &Metrics) -> Fram
         .enumerate()
         .map(|(i, b)| {
             let from_right = n - i as f32; // the last button is 1 slot from the right
-            let x = header.right() - from_right * (m.button + inset);
+            let x = header.right() - inset - m.button - (from_right - 1.0) * m.target;
             (*b, Rect::new(x, header.y + inset, m.button, m.button))
         })
         .filter(|(_, r)| r.x >= header.x && r.bottom() <= header.bottom())
@@ -544,6 +549,33 @@ mod tests {
         assert!(f.buttons.windows(2).all(|w| w[0].1.right() < w[1].1.x), "left to right, no overlap");
         assert_eq!(s.hit(close.center()), Hit::Button(A, Close));
         assert_eq!(s.hit(f.buttons[0].1.center()), Hit::Button(A, SplitRight));
+    }
+
+    #[test]
+    fn top_bar_buttons_and_dock_chips_are_at_least_24_by_24() {
+        // WCAG 2.5.8 Target Size (Minimum). @see https://www.w3.org/TR/WCAG22/#target-size-minimum
+        let s = scene(&busy(), 800.0, 600.0, false, &m());
+        let rects: Vec<Rect> = s.chrome.iter().map(|b| b.1).chain(s.chips.iter().map(|c| c.1)).collect();
+        assert_eq!(rects.len(), 3);
+        for r in rects {
+            assert!(r.w >= 24.0 && r.h >= 24.0, "{r:?}");
+        }
+    }
+
+    #[test]
+    fn header_buttons_are_spaced_so_24_px_circles_around_them_do_not_overlap() {
+        // WCAG 2.5.8's spacing exception for targets under 24 px; the header keeps 3 px above
+        // and below for divider and resize bands.
+        let s = scene(&busy(), 800.0, 600.0, false, &m());
+        for f in s.tiles.iter().chain(&s.cards) {
+            for w in f.buttons.windows(2) {
+                let (a, b) = (w[0].1.center(), w[1].1.center());
+                assert!(b.x - a.x >= 24.0, "{:?} and {:?}", w[0], w[1]);
+            }
+            for (_, r) in &f.buttons {
+                assert_eq!((r.y - f.header.y, f.header.bottom() - r.bottom()), (3.0, 3.0));
+            }
+        }
     }
 
     #[test]

@@ -74,7 +74,8 @@ pub fn background(pen: &Pen, scene: &Scene) {
 pub fn top_bar(pen: &mut Pen, scene: &Scene, title: &str, hover: Hit) {
     let c = pen.chrome;
     let (canvas, scale) = (pen.canvas, pen.scale);
-    for &(b, r) in &scene.chrome {
+    for &(b, hit) in &scene.chrome {
+        let r = visible(hit, scale);
         button_back(canvas, c, r, hover == Hit::Chrome(b));
         let mut p = stroke(col(c.text_dim), scale);
         let (cx, cy, s) = (r.x + r.w / 2.0, r.y + r.h / 2.0, r.w * 0.28);
@@ -196,6 +197,14 @@ fn header_content(pen: &mut Pen, f: &Frame, look: &PaneLook, hover: Hit, buttons
         button_back(canvas, c, r, hover == Hit::Button(f.pane, b));
         icon(canvas, b, r, look.zoomed, ink, scale);
     }
+}
+
+/// The drawn part of a top bar button's 24 pt hit target: 18 pt, centered, the size of a
+/// header button.
+fn visible(hit: Rect, scale: f32) -> Rect {
+    let side = (18.0 * scale).round().min(hit.w).min(hit.h);
+    let (x, y) = ((hit.x + (hit.w - side) / 2.0).round(), (hit.y + (hit.h - side) / 2.0).round());
+    Rect::new(x, y, side, side)
 }
 
 fn button_back(canvas: &Canvas, c: &Chrome, r: Rect, hovered: bool) {
