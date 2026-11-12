@@ -38,11 +38,15 @@ pub struct Config {
     pub palette: BTreeMap<u8, Rgb>,
     pub padding_x: Padding,
     pub padding_y: Padding,
+    /// How much of an unfocused pane shows through its fade, 0.15 to 1 (1: no fade).
+    pub unfocused_split_opacity: f32,
+    /// The fade's color; `None` is the background.
+    pub unfocused_split_fill: Option<Rgb>,
 }
 
 /// Ghostty's defaults, so a Ghostty config that leaves a key out looks the same in Frith.
 /// @see Ghostty `src/config/Config.zig` (`font-size`, `background`, `foreground`,
-/// `window-padding-x`, `window-padding-y`)
+/// `window-padding-x`, `window-padding-y`, `unfocused-split-opacity`, `unfocused-split-fill`)
 impl Default for Config {
     fn default() -> Config {
         Config {
@@ -54,6 +58,8 @@ impl Default for Config {
             palette: BTreeMap::new(),
             padding_x: Padding { start: 2.0, end: 2.0 },
             padding_y: Padding { start: 2.0, end: 2.0 },
+            unfocused_split_opacity: 0.7,
+            unfocused_split_fill: None,
         }
     }
 }
@@ -119,6 +125,11 @@ impl Config {
             }
             "window-padding-x" => self.padding_x = if empty { d.padding_x } else { padding(value)? },
             "window-padding-y" => self.padding_y = if empty { d.padding_y } else { padding(value)? },
+            "unfocused-split-opacity" if empty => self.unfocused_split_opacity = d.unfocused_split_opacity,
+            "unfocused-split-opacity" => self.unfocused_split_opacity = opacity(value)?,
+            "unfocused-split-fill" => {
+                self.unfocused_split_fill = if empty { d.unfocused_split_fill } else { Some(color(value)?) }
+            }
             _ => return Ok(false),
         }
         Ok(true)
@@ -129,6 +140,13 @@ impl Config {
 fn size(value: &str) -> Result<f32, String> {
     let points = value.parse::<f32>().ok().filter(|s| s.is_finite() && *s > 0.0);
     points.map(|p| p.clamp(1.0, 255.0)).ok_or_else(|| format!("not a size: {value:?}"))
+}
+
+/// A fraction clamped to 0.15-1, as Ghostty clamps `unfocused-split-opacity`.
+/// @see Ghostty `src/config/Config.zig` (`finalize`)
+fn opacity(value: &str) -> Result<f32, String> {
+    let v = value.parse::<f32>().ok().filter(|v| v.is_finite());
+    v.map(|v| v.clamp(0.15, 1.0)).ok_or_else(|| format!("not a number: {value:?}"))
 }
 
 /// `#RRGGBB`, `RRGGBB`, `#RGB` or `RGB`. Ghostty also takes X11 names and `rgb:` forms.
@@ -210,6 +228,7 @@ mod tests {
             palette: BTreeMap::from([(0, rgb(0x21252b)), (12, rgb(0x61afef))]),
             padding_x: Padding { start: 8.0, end: 8.0 },
             padding_y: Padding { start: 6.0, end: 2.0 },
+            ..Config::default()
         };
         assert_eq!(c, want);
     }
@@ -269,6 +288,24 @@ mod tests {
         assert_eq!(c.font_size, 1.0);
         c.read("font-size = 1000\n");
         assert_eq!(c.font_size, 255.0);
+    }
+
+    #[test]
+    fn unfocused_panes_fade_as_in_ghostty() {
+        let d = Config::default();
+        assert_eq!((d.unfocused_split_opacity, d.unfocused_split_fill), (0.7, None));
+        let mut c = Config::default();
+        let notes = c.read("unfocused-split-opacity = 0.5\nunfocused-split-fill = #102030\n");
+        assert!(notes.errors.is_empty() && notes.ignored.is_empty(), "{notes:?}");
+        assert_eq!((c.unfocused_split_opacity, c.unfocused_split_fill), (0.5, Some(rgb(0x102030))));
+        // Clamped to 0.15-1 as Ghostty clamps it.
+        c.read("unfocused-split-opacity = 0\n");
+        assert_eq!(c.unfocused_split_opacity, 0.15);
+        c.read("unfocused-split-opacity = 3\n");
+        assert_eq!(c.unfocused_split_opacity, 1.0);
+        let notes = c.read("unfocused-split-opacity = dim\nunfocused-split-opacity =\nunfocused-split-fill =\n");
+        assert_eq!(notes.errors.len(), 1, "{notes:?}");
+        assert_eq!((c.unfocused_split_opacity, c.unfocused_split_fill), (0.7, None), "empty restores the default");
     }
 
     #[test]

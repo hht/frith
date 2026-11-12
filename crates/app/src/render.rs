@@ -109,6 +109,14 @@ pub fn tile_header(pen: &mut Pen, f: &Frame, look: &PaneLook, hover: Hit) {
     header_content(pen, f, look, hover, look.focused || look.hovered);
 }
 
+/// Fades an unfocused pane's content, as Ghostty does, so the focused one stands out.
+/// @see Ghostty `macos/Sources/Ghostty/Surface View/SurfaceView.swift` (the unfocused overlay)
+pub fn fade(pen: &Pen, content: Rect, fade: Tint) {
+    let mut p = Paint::default();
+    p.set_color(tint(fade));
+    pen.canvas.draw_rect(sk(content), &p);
+}
+
 /// Everything below the tiles' grids: the 1 px lines between tiles, `lit` in the accent.
 pub fn dividers(pen: &Pen, dividers: &[Divider], lit: Option<usize>) {
     let c = pen.chrome;

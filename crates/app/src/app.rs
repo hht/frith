@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use frith_core::colors::Chrome;
+use frith_core::colors::{Chrome, Tint};
 use frith_core::config::{Config, Rgb};
 use frith_core::geom::{Point, Rect};
 use frith_core::gesture::{Effect, Gesture};
@@ -101,6 +101,9 @@ pub struct App {
     cache: PathBuf,
     /// Chrome colors, from the terminal colors the config sets (ADR 14).
     chrome: Chrome,
+    /// Laid over unfocused panes' content while more than one shows; `None` when the
+    /// config turns the fade off.
+    fade: Option<Tint>,
     proxy: EventLoopProxy,
     win: Option<Win>,
     sidebar: bool,
@@ -134,6 +137,7 @@ impl App {
         App {
             cfg,
             chrome: chrome_for(&config),
+            fade: fade_for(&config),
             config,
             cache,
             proxy,
@@ -400,7 +404,8 @@ impl App {
         let hovered = hit_pane(self.hover);
         let pad = self.pad();
         let pad = (pad.left as f32, pad.top as f32);
-        let App { win, panes, layout, focus, hover, pointer, preedit, chrome, .. } = self;
+        let App { win, panes, layout, focus, hover, pointer, preedit, chrome, fade, .. } = self;
+        let fade = fade.filter(|_| scene.tiles.len() + scene.cards.len() > 1);
         let chrome = &*chrome;
         let layout = &*layout;
         let (focus, hover, pointer) = (*focus, *hover, *pointer);
@@ -429,6 +434,9 @@ impl App {
                     update: held.is_none(),
                 };
                 let at = p.grid.draw(canvas, pen.fonts, atlas, ctx, &p.session.term, &look);
+                if let Some(t) = fade.filter(|_| !focused) {
+                    render::fade(&pen, f.content, t);
+                }
                 if focused {
                     cursor = at;
                 }
@@ -1003,4 +1011,28 @@ impl ApplicationHandler for App {
 fn chrome_for(config: &Config) -> Chrome {
     let entry = |i: u8, r: u8, g: u8, b: u8| config.palette.get(&i).copied().unwrap_or(Rgb { r, g, b });
     Chrome::derive(config.background, config.foreground, entry(4, 0x81, 0xa2, 0xbe), entry(3, 0xf0, 0xc6, 0x74))
+}
+
+/// The fade over unfocused panes: their content shows through at
+/// `unfocused-split-opacity`, under `unfocused-split-fill` or the background.
+/// @see Ghostty `macos/Sources/Ghostty/Ghostty.Config.swift` (`unfocusedSplitOpacity`, `unfocusedSplitFill`)
+fn fade_for(config: &Config) -> Option<Tint> {
+    let alpha = ((1.0 - config.unfocused_split_opacity) * 255.0).round() as u8;
+    let rgb = config.unfocused_split_fill.unwrap_or(config.background);
+    (alpha > 0).then_some(Tint { rgb, alpha })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unfocused_panes_fade_by_the_complement_of_the_opacity_under_the_fill_or_background() {
+        let mut c = Config::default();
+        assert_eq!(fade_for(&c), Some(Tint { rgb: c.background, alpha: 77 }), "0.7: 30% of the background");
+        c.read("unfocused-split-opacity = 0.15\nunfocused-split-fill = #102030\n");
+        assert_eq!(fade_for(&c), Some(Tint { rgb: Rgb { r: 0x10, g: 0x20, b: 0x30 }, alpha: 217 }));
+        c.read("unfocused-split-opacity = 1\n");
+        assert_eq!(fade_for(&c), None, "fully opaque: no fade");
+    }
 }
