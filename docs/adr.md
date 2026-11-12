@@ -22,11 +22,11 @@
 决定：提供原生的非终端面板（diff、Markdown）；v1 只做一到两种。
 理由：这是相对 herdr 等纯 TUI 多路复用器的差异点；数量受控以免拖慢 v1。
 
-## 5. 只内置 Nerd Font 图标字体，文字字体由用户配置（2026-11-12，同日修订）
+## 5. 内置 JetBrains Mono 与 Nerd Font 图标字体，文字字体可由用户配置（2026-11-12，同日两次修订）
 
-决定：内置 Symbols Nerd Font Mono（v3.5.1，`SymbolsNerdFontMono-Regular.ttf`，2,610,012 字节，只含图标、不含文字字形），作为回退链中排在系统回退之前的一环；文字字体及其回退列表由用户在配置中指定；回退时跳过 LastResort；powerline（U+E0B0–E0BF）、框线、方块字形由程序自绘。
-理由：未装 Nerd Font 的机器上 p10k 等提示符的图标会显示为 `?`（spike 问题 7），用户选择以约 2.6 MB 体积换开箱即用。文字字体仍不内置以控制体积。自绘字形保证提示符与 TUI 边框在任何字体下对齐。
-修订前：不内置任何字体。
+决定：内置 JetBrains Mono 2.304 常规体可变字体（`JetBrainsMono[wght].ttf`，303,144 字节，OFL 1.1，粗体用 `wght` 700，暂不内置斜体）与 Symbols Nerd Font Mono（v3.5.1，`SymbolsNerdFontMono-Regular.ttf`，2,610,012 字节，只含图标）。字体回退顺序与 Ghostty 一致：用户配置的字体中已安装的 → JetBrains Mono → Nerd 图标字体 → 系统按字符回退；配置的字体都未安装时由 JetBrains Mono 决定格子大小。回退时跳过 LastResort。powerline（U+E0B0–E0BF）、框线、方块字形由程序自绘（暂缓）。
+理由：用户要求与 Ghostty 一致，Ghostty 内置同一字体并按此顺序回退（`src/font/SharedGridSet.zig`、`src/font/embedded.zig`）；内置文字字体也让 macOS、Windows、Linux 的默认外观一致，不依赖各系统自带字体。用约 0.3 MB 换一致性。未装 Nerd Font 的机器上 p10k 等提示符的图标会显示为 `?`（spike 问题 7），用户选择以约 2.6 MB 体积换开箱即用。
+修订前：第一次修订前不内置任何字体；第二次修订前只内置 Nerd 图标字体，文字字体不内置，配置的字体未安装时退回 Menlo。
 
 ## 6. 窗口 = 平铺层 + 浮动层，面板不离开根窗口（2026-11-12，同日修订）
 
@@ -67,3 +67,18 @@
 - 拖分隔条和改变窗口大小时不加动画，直接跟手。
 - 遵从 macOS「减弱动态效果」：开启时粒子改为淡入淡出，重排过渡瞬间完成。
 理由：用户要求的视觉卖点（产品目标中的「醒目 UI」）。
+
+## 11. 自带极简 shell 集成，只做提示符标记（2026-11-12）
+
+决定：按 OSC 133 公开规范自行编写极简 shell 集成，只发提示符标记（`133;A;redraw=1`、`B`、`C`、`D`），让终端在 resize 时清掉旧提示符、由 shell 重绘。先做 zsh（macOS 默认 shell），bash、fish 随后。注入方式参照 Ghostty（MIT）的 `src/termio/shell_integration.zig`：zsh 用 `ZDOTDIR` 指向集成目录，先恢复用户原有 `ZDOTDIR` 并加载其 `.zshenv`。不复制 Ghostty 或 Kitty 的集成脚本。
+理由：libghostty-vt 的 C API 默认不清除提示符（`c/terminal.zig:1056`，`shell_redraws_prompt = .false`），且无选项可改，只能由 shell 以 `redraw=1` 开启；没有标记时窗口 resize 会堆叠提示符。只合并 resize（已实现，25 ms）只能减少次数。Ghostty 的 zsh、bash 集成脚本为 GPLv3（源自 Kitty），直接内置会约束产品授权；自写只含所需部分。
+
+## 12. 不内置统一的 shell 主题，修渲染（2026-11-12）
+
+决定：不替换或覆盖用户的 shell 提示符主题（如 p10k）。提示符与 TUI 显示不对，从渲染根因修：按 ADR 5 自绘框线、powerline、块字形（含 ░▒▓），文字字体改为可配置；终端配色主题按 ADR 3 沿用 Ghostty 主题，与此互补。
+理由：p10k 的框线断开、分隔符不贴合等问题来自字体字形未填满格子与自绘字形未实现，同样影响 starship、vim、htop；改用户主题违反「TUI 表现与参考终端一致」。
+
+## 13. 配置用 Ghostty 格式，没有 Frith 配置时读 Ghostty 的（2026-11-12）
+
+决定：Frith 读取自己的配置文件，语法与键名沿用 Ghostty（`key = value`，`#` 开头为注释，值可加双引号，空值恢复默认，`font-family`、`palette` 可重复）。Frith 的配置文件不存在时，按 Ghostty 的顺序读取用户的 Ghostty 配置（先 `$XDG_CONFIG_HOME/ghostty/`，再 macOS 的 `~/Library/Application Support/com.mitchellh.ghostty/`）。不认识的键忽略并提示。`theme` 暂不支持。配置的字体未安装时按 ADR 5 退回内置的 JetBrains Mono，与 Ghostty 一致。第一步支持字体、字号、前景与背景色、光标色、调色板、内边距；背景透明、模糊、`font-thicken` 另行调研。
+理由：用户截图对比显示，Frith 与其 Ghostty 的差异全部来自配置（背景、字体、字号、调色板、内边距），而 256 色色块的显示值完全一致。读取已有 Ghostty 配置可让用户开箱即得同样外观，兑现 ADR 3「沿用 Ghostty 的配置格式与主题」。
