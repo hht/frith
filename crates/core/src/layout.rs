@@ -6,7 +6,7 @@
 //! Must not know: terminals, drawing, window-system events, chrome (headers, dock bar), or
 //! time. Units are whatever the caller passes; the app uses physical pixels.
 
-use crate::geom::{Point, Rect};
+use crate::geom::Rect;
 
 /// Stable identity of a pane for its whole life.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
@@ -215,36 +215,6 @@ impl Layout {
         self.debug_check();
     }
 
-    /// Where `dragged` would land if released at `p`. Within `band` of the area's border the
-    /// whole window is targeted. A tiled pane targets the nearest edge of the tile under `p`
-    /// within 30% of its size, else swaps with it; a floating pane moves freely except
-    /// within `band` of a tile's edge (ADR 6). `None` means no dock: over `dragged` itself,
-    /// outside `area`, or a free move.
-    pub fn drop_target(&self, area: Rect, gap: f32, band: f32, p: Point, dragged: PaneId) -> Option<Drop> {
-        if !area.contains(p) {
-            return None;
-        }
-        let tiled = self.is_tiled(dragged);
-        if tiled && self.root == Some(Node::Leaf(dragged)) {
-            return None; // nowhere else to go
-        }
-        let (d, edge) = nearest_edge(p, area);
-        if d < band {
-            return Some(Drop::Window(edge));
-        }
-        let (target, r) = self.tiles(area, gap).into_iter().find(|(_, r)| r.contains(p))?;
-        if target == dragged {
-            return None;
-        }
-        let (d, edge) = nearest_edge(p, r);
-        if tiled {
-            let span = if edge.axis() == Axis::Horizontal { r.w } else { r.h };
-            Some(if d < EDGE_ZONE * span { Drop::Split(target, edge) } else { Drop::Swap(target) })
-        } else {
-            (d < band).then_some(Drop::Split(target, edge))
-        }
-    }
-
     /// Where `pane` would sit after `apply(pane, drop)`, for a preview that matches the landing
     /// exactly (ADR 6): the dragged pane leaves its old place and zoom resets first.
     pub fn drop_preview(&self, area: Rect, gap: f32, pane: PaneId, drop: Drop) -> Rect {
@@ -254,8 +224,8 @@ impl Layout {
         tiles.into_iter().find(|(p, _)| *p == pane).expect("apply tiles the pane").1
     }
 
-    /// Moves tiled or floating `pane` to `drop`, as computed by `drop_target` for this
-    /// layout and pane, and resets zoom so the moved pane is visible.
+    /// Moves tiled or floating `pane` to `drop`, which must target a tile other than `pane`,
+    /// and resets zoom so the moved pane is visible.
     pub fn apply(&mut self, pane: PaneId, drop: Drop) {
         self.zoomed = None;
         if let Drop::Swap(target) = drop {
@@ -295,6 +265,11 @@ impl Layout {
 
     pub fn is_tiled(&self, pane: PaneId) -> bool {
         self.root.as_ref().is_some_and(|n| n.contains(pane))
+    }
+
+    /// `pane` is the only tiled pane, so dragging it can dock nowhere else.
+    pub fn is_only_tile(&self, pane: PaneId) -> bool {
+        self.root == Some(Node::Leaf(pane))
     }
 
     pub fn contains(&self, pane: PaneId) -> bool {
@@ -527,17 +502,6 @@ impl Node {
     }
 }
 
-/// Fraction of a tile's width or height, measured from an edge, in which a dragged tile
-/// splits that edge; the rest of the tile is the swap zone.
-const EDGE_ZONE: f32 = 0.3;
-
-/// Distance from `p` (inside `r`) to the nearest edge of `r`, and that edge.
-fn nearest_edge(p: Point, r: Rect) -> (f32, Edge) {
-    [(p.x - r.x, Edge::Left), (r.right() - p.x, Edge::Right), (p.y - r.y, Edge::Top), (r.bottom() - p.y, Edge::Bottom)]
-        .into_iter()
-        .fold((f32::INFINITY, Edge::Left), |best, c| if c.0 < best.0 { c } else { best })
-}
-
 /// `r` shrunk to fit `area` if needed (never below zero), then shifted so it lies inside
 /// `area`. Not `f32::clamp`: rounding can put `area.right() - w` a hair below `area.x`, and
 /// clamp panics when min > max; the left/top edge wins then.
@@ -761,35 +725,10 @@ mod tests {
     }
 
     #[test]
-    fn dragging_a_tile_targets_pane_edges_centers_for_swap_and_window_edges() {
-        let l = abc(); // A (0,0,500,300)  B (500,0,500,300)  C (0,300,1000,300)
-        let at = |x, y| l.drop_target(AREA, 0.0, 24.0, Point::new(x, y), A);
-        assert_eq!(at(750.0, 20.0 + 24.0), Some(Drop::Split(B, Edge::Top)));
-        assert_eq!(at(980.0 - 24.0, 150.0), Some(Drop::Split(B, Edge::Right)));
-        assert_eq!(at(750.0, 150.0), Some(Drop::Swap(B)), "center swaps");
-        assert_eq!(at(500.0, 590.0), Some(Drop::Window(Edge::Bottom)), "window band");
-        assert_eq!(at(250.0, 150.0), None, "over the dragged pane itself");
-        assert_eq!(at(1200.0, 150.0), None, "outside the area");
-    }
-
-    #[test]
-    fn dragging_a_float_only_docks_inside_narrow_bands_and_otherwise_moves_freely() {
-        let mut l = abc();
-        l.float(B, Rect::new(0.0, 0.0, 100.0, 100.0)); // A (0,0,1000,300)  C (0,300,1000,300)
-        let at = |x, y| l.drop_target(AREA, 0.0, 24.0, Point::new(x, y), B);
-        assert_eq!(at(500.0, 150.0), None, "pane center: free move");
-        assert_eq!(at(500.0, 280.0), Some(Drop::Split(A, Edge::Bottom)), "pane edge band");
-        assert_eq!(at(500.0, 10.0), Some(Drop::Window(Edge::Top)), "window band wins");
-        assert_eq!(at(500.0, 400.0), None);
-    }
-
-    #[test]
-    fn a_float_dropped_on_an_empty_tiled_layer_docks_from_the_window_band() {
+    fn a_float_docked_to_an_empty_tiled_layer_fills_it() {
         let mut l = Layout::default();
         l.split_window(Edge::Right, A);
         l.float(A, Rect::new(0.0, 0.0, 100.0, 100.0));
-        assert_eq!(l.drop_target(AREA, 0.0, 24.0, Point::new(5.0, 300.0), A), Some(Drop::Window(Edge::Left)));
-        assert_eq!(l.drop_target(AREA, 0.0, 24.0, Point::new(500.0, 300.0), A), None);
         assert_eq!(l.drop_preview(AREA, 0.0, A, Drop::Window(Edge::Left)), AREA, "it will fill the area");
     }
 
@@ -806,8 +745,7 @@ mod tests {
         let mut l = Layout::default();
         l.split_window(Edge::Right, A);
         l.split(A, Edge::Right, B); // A (0,0,500,600)  B (500,0,500,600)
-        let drop = l.drop_target(AREA, 0.0, 24.0, Point::new(530.0, 300.0), A).unwrap();
-        assert_eq!(drop, Drop::Split(B, Edge::Left));
+        let drop = Drop::Split(B, Edge::Left);
         let preview = l.drop_preview(AREA, 0.0, A, drop);
         assert_eq!(preview, Rect::new(0.0, 0.0, 500.0, 600.0), "B fills A's old space first, then splits");
         l.apply(A, drop);

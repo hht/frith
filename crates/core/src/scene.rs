@@ -6,7 +6,7 @@
 //! layout decides the arrangement; this module only dresses it.
 
 use crate::geom::{Point, Rect};
-use crate::layout::{Axis, Divider, Layout, PaneId};
+use crate::layout::{Axis, Divider, Drop, Edge, Layout, PaneId};
 
 /// Chrome sizes in the caller's units (the app passes physical pixels).
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -29,6 +29,8 @@ pub struct Metrics {
     pub divider_grab: f32,
     /// Width of the band inside a card's border that resizes it.
     pub resize_grab: f32,
+    /// Side of a square dock guide.
+    pub guide: f32,
 }
 
 impl Metrics {
@@ -47,6 +49,7 @@ impl Metrics {
             chip: px(160.0),
             divider_grab: px(8.0),
             resize_grab: px(6.0),
+            guide: px(32.0),
         }
     }
 }
@@ -68,6 +71,17 @@ pub struct Scene {
     /// Minimized panes in the dock bar, left to right.
     pub chips: Vec<(PaneId, Rect)>,
     pub metrics: Metrics,
+}
+
+/// Dock guides while a pane is dragged (ADR 6).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Guides {
+    /// The tile whose guides are shown, drawn highlighted.
+    pub target: Option<PaneId>,
+    /// Each guide and the drop it picks.
+    pub buttons: Vec<(Drop, Rect)>,
+    /// The drop of the guide under the pointer; `None` means no dock.
+    pub active: Option<Drop>,
 }
 
 /// Which borders of a card a resize drag moves.
@@ -233,6 +247,80 @@ impl Scene {
         }
         Hit::Nothing
     }
+
+    /// Dock guides for dragging `dragged` with the pointer at `p` (ADR 6): one inside the
+    /// middle of each area edge for the whole window, and for the target tile one on each side
+    /// of its center, plus a swap guide on it when `dragged` is tiled. Bottom to top.
+    ///
+    /// The target is `held` (the previous target) while `p` stays within its guides, which may
+    /// reach past the tile and draw above every card; otherwise it is the tile under `p`
+    /// unless another card hides it there. A tile's guides keep clear of the window guides so
+    /// every guide stays reachable.
+    pub fn guides(&self, layout: &Layout, dragged: PaneId, p: Point, held: Option<PaneId>) -> Guides {
+        if layout.is_only_tile(dragged) {
+            return Guides { target: None, buttons: Vec::new(), active: None };
+        }
+        let (a, s, pad) = (self.area, self.metrics.guide, self.metrics.pad);
+        let (cx, cy) = (a.center().x - s / 2.0, a.center().y - s / 2.0);
+        let mut buttons = vec![
+            (Drop::Window(Edge::Left), Rect::new(a.x + pad, cy, s, s)),
+            (Drop::Window(Edge::Right), Rect::new(a.right() - pad - s, cy, s, s)),
+            (Drop::Window(Edge::Top), Rect::new(cx, a.y + pad, s, s)),
+            (Drop::Window(Edge::Bottom), Rect::new(cx, a.bottom() - pad - s, s, s)),
+        ];
+        let compass = |f: &Frame| self.compass(f.outer.center(), &buttons);
+        let candidates = self.tiles.iter().filter(|f| f.pane != dragged);
+        let kept = candidates.clone().find(|f| Some(f.pane) == held && compass(f).contains(p));
+        let target = kept.or_else(|| {
+            let hidden = self.cards.iter().any(|c| c.pane != dragged && c.outer.contains(p));
+            candidates.clone().find(|f| f.outer.contains(p)).filter(|_| !hidden)
+        });
+        if let Some(f) = target {
+            let c = compass(f).center();
+            let step = s + pad / 2.0;
+            for (edge, dx, dy) in
+                [(Edge::Left, -step, 0.0), (Edge::Right, step, 0.0), (Edge::Top, 0.0, -step), (Edge::Bottom, 0.0, step)]
+            {
+                buttons.push((Drop::Split(f.pane, edge), Rect::new(c.x + dx - s / 2.0, c.y + dy - s / 2.0, s, s)));
+            }
+            if layout.is_tiled(dragged) {
+                buttons.push((Drop::Swap(f.pane), Rect::new(c.x - s / 2.0, c.y - s / 2.0, s, s)));
+            }
+        }
+        // Tile guides draw above window guides and win where a tiny area leaves no room.
+        let active = buttons.iter().rev().find(|(_, r)| r.contains(p)).map(|(d, _)| *d);
+        Guides { target: target.map(|f| f.pane), buttons, active }
+    }
+
+    /// The square spanned by a tile's guides when centered on `center`, kept inside the area
+    /// and then moved clear of the `window` guides by half a pad. An area under about three
+    /// compasses wide or high leaves no room to clear guides on both sides; tile guides win
+    /// there (see `guides`).
+    fn compass(&self, center: Point, window: &[(Drop, Rect)]) -> Rect {
+        let (s, pad, a) = (self.metrics.guide, self.metrics.pad, self.area);
+        let side = 3.0 * s + pad;
+        let x = (center.x - side / 2.0).min(a.right() - side).max(a.x);
+        let y = (center.y - side / 2.0).min(a.bottom() - side).max(a.y);
+        let mut r = Rect::new(x, y, side, side);
+        let clear = pad / 2.0;
+        for (drop, w) in window {
+            let near = r.x < w.right() + clear
+                && w.x - clear < r.right()
+                && r.y < w.bottom() + clear
+                && w.y - clear < r.bottom();
+            if !near {
+                continue;
+            }
+            match drop {
+                Drop::Window(Edge::Left) => r.x = w.right() + clear,
+                Drop::Window(Edge::Right) => r.x = w.x - clear - side,
+                Drop::Window(Edge::Top) => r.y = w.bottom() + clear,
+                Drop::Window(Edge::Bottom) => r.y = w.y - clear - side,
+                _ => unreachable!("only window guides are passed"),
+            }
+        }
+        r
+    }
 }
 
 impl Frame {
@@ -248,7 +336,7 @@ impl Frame {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::layout::Edge;
+    use crate::layout::{Drop, Edge};
 
     const A: PaneId = PaneId(1);
     const B: PaneId = PaneId(2);
@@ -263,6 +351,182 @@ mod tests {
         let mut l = Layout::default();
         l.split_window(Edge::Right, A);
         l
+    }
+
+    /// A | B tiles, C floating at the bottom left over A.
+    fn two_and_a_card() -> Layout {
+        let mut l = one();
+        l.split(A, Edge::Right, B);
+        l.split(A, Edge::Bottom, C);
+        l.float(C, Rect::new(20.0, 400.0, 200.0, 100.0));
+        l
+    }
+
+    fn center_of(s: &Scene, pane: PaneId) -> Point {
+        s.tiles.iter().find(|f| f.pane == pane).unwrap().outer.center()
+    }
+
+    /// Guides are 32 px squares; the four around a tile's center sit 36 px from it.
+    const STEP: f32 = 36.0;
+
+    #[test]
+    fn dragging_a_card_over_a_tile_targets_it_with_four_guides_that_each_pick_a_split() {
+        let s = scene(&two_and_a_card(), 800.0, 600.0, false, &m());
+        let c = center_of(&s, B);
+        let at = |dx: f32, dy: f32| s.guides(&two_and_a_card(), C, Point::new(c.x + dx, c.y + dy), None);
+        let g = at(100.0, 100.0);
+        assert_eq!(g.target, Some(B));
+        assert_eq!(g.active, None, "off the guides the card moves freely");
+        assert_eq!(at(STEP, 0.0).active, Some(Drop::Split(B, Edge::Right)));
+        assert_eq!(at(-STEP, 0.0).active, Some(Drop::Split(B, Edge::Left)));
+        assert_eq!(at(0.0, -STEP).active, Some(Drop::Split(B, Edge::Top)));
+        assert_eq!(at(0.0, STEP + 15.0).active, Some(Drop::Split(B, Edge::Bottom)), "anywhere on the guide");
+        assert_eq!(at(0.0, 0.0).active, None, "no swap for a card");
+    }
+
+    #[test]
+    fn dragging_a_tile_adds_a_center_guide_that_swaps_but_none_over_the_tile_itself() {
+        let l = two_and_a_card();
+        let s = scene(&l, 800.0, 600.0, false, &m());
+        let c = center_of(&s, B);
+        assert_eq!(s.guides(&l, A, c, None).active, Some(Drop::Swap(B)));
+        assert_eq!(s.guides(&l, A, Point::new(c.x + STEP, c.y), None).active, Some(Drop::Split(B, Edge::Right)));
+        let own = s.guides(&l, A, center_of(&s, A), None);
+        assert_eq!((own.target, own.active), (None, None));
+    }
+
+    #[test]
+    fn guides_at_the_middle_of_each_area_edge_dock_to_the_whole_window() {
+        let l = two_and_a_card();
+        let s = scene(&l, 800.0, 600.0, false, &m()); // area (0, 30, 800, 540)
+        let at = |x, y| s.guides(&l, A, Point::new(x, y), None).active;
+        assert_eq!(at(24.0, 300.0), Some(Drop::Window(Edge::Left)), "over A itself, still active");
+        assert_eq!(at(776.0, 300.0), Some(Drop::Window(Edge::Right)));
+        assert_eq!(at(400.0, 54.0), Some(Drop::Window(Edge::Top)));
+        assert_eq!(at(400.0, 546.0), Some(Drop::Window(Edge::Bottom)));
+        assert_eq!(at(4.0, 300.0), None, "inset from the edge, not a band along it");
+        assert_eq!(at(24.0, 100.0), None);
+    }
+
+    #[test]
+    fn other_cards_hide_the_tiles_under_them_unless_the_pointer_brings_a_target_along() {
+        let mut l = two_and_a_card();
+        l.move_float(C, Rect::new(100.0, 250.0, 250.0, 150.0)); // over A's center
+        let s = scene(&l, 800.0, 600.0, false, &m());
+        let c = center_of(&s, A);
+        let right_guide = Point::new(c.x + STEP, c.y);
+        let g = s.guides(&l, B, right_guide, None);
+        assert_eq!((g.target, g.active), (None, None), "C hides A, guides and all");
+        let g = s.guides(&l, B, Point::new(80.0, 300.0), None);
+        assert_eq!(g.target, Some(A), "A's visible part makes it the target");
+        let g = s.guides(&l, B, right_guide, g.target);
+        assert_eq!(g.active, Some(Drop::Split(A, Edge::Right)), "its guides draw above cards");
+        let between = Point::new(c.x + STEP / 2.0, c.y - STEP / 2.0);
+        assert_eq!(s.guides(&l, B, between, Some(A)).target, Some(A), "no flicker between guides");
+        assert_eq!(s.guides(&l, B, Point::new(120.0, 380.0), Some(A)).target, None, "off the guides, C hides A again");
+        assert_eq!(s.guides(&l, C, Point::new(120.0, 380.0), None).target, Some(A), "the dragged card hides nothing");
+    }
+
+    /// A narrow tile A at the left edge, B beside it, C floating.
+    fn narrow_left() -> Layout {
+        let mut l = two_and_a_card();
+        let area = scene(&l, 800.0, 600.0, false, &m()).area;
+        l.drag_divider(area, 1.0, 0, 120.0, 10.0);
+        l
+    }
+
+    #[test]
+    fn a_narrow_tiles_guides_make_way_for_the_window_guides_and_reach_past_its_edge() {
+        let l = narrow_left();
+        let s = scene(&l, 800.0, 600.0, false, &m());
+        assert_eq!(s.tiles[0].outer, Rect::new(0.0, 30.0, 120.0, 540.0), "setup");
+        let at = |x, y, held| s.guides(&l, C, Point::new(x, y), held).active;
+        assert_eq!(at(24.0, 300.0, None), Some(Drop::Window(Edge::Left)), "the window guide stays reachable");
+        // A's guides move right until clear of the window guide (8..40) by half a pad: left
+        // guide 44..76, right guide 116..148, reaching into B.
+        assert_eq!(at(60.0, 300.0, None), Some(Drop::Split(A, Edge::Left)));
+        assert_eq!(at(132.0, 300.0, Some(A)), Some(Drop::Split(A, Edge::Right)), "held while on its guides");
+        assert_eq!(s.guides(&l, C, Point::new(132.0, 300.0), None).target, Some(B), "fresh over B, B is the target");
+    }
+
+    #[test]
+    fn a_short_tiles_guides_stay_inside_the_area_and_clear_of_the_window_guides() {
+        let mut l = one();
+        l.split(A, Edge::Bottom, B);
+        l.split(A, Edge::Right, D);
+        l.split(B, Edge::Right, C);
+        l.float(C, Rect::new(500.0, 400.0, 200.0, 100.0));
+        let area = scene(&l, 800.0, 600.0, false, &m()).area;
+        l.drag_divider(area, 1.0, 0, 90.0, 10.0);
+        let s = scene(&l, 800.0, 600.0, false, &m());
+        assert_eq!(s.tiles[0].outer, Rect::new(0.0, 30.0, 400.0, 60.0), "setup: A top left");
+        assert_eq!(s.tiles[1].outer, Rect::new(401.0, 30.0, 399.0, 60.0), "setup: D top right");
+        let at = |x, y| s.guides(&l, C, Point::new(x, y), None).active;
+        // Centered on A the top guide would sit at y 8..40, over the top bar; kept inside the
+        // area it sits at 30..62.
+        assert_eq!(at(200.0, 50.0), Some(Drop::Split(A, Edge::Top)));
+        assert_eq!(at(600.0, 50.0), Some(Drop::Split(D, Edge::Top)), "the same for D");
+        assert_eq!(at(400.0, 54.0), Some(Drop::Window(Edge::Top)), "between them, the window's");
+    }
+
+    #[test]
+    fn the_only_tile_has_nowhere_to_go_and_a_card_over_an_empty_layer_docks_at_the_edges() {
+        let mut l = one();
+        l.toggle_zoom(A);
+        let s = scene(&l, 800.0, 600.0, false, &m());
+        assert_eq!(s.guides(&l, A, Point::new(24.0, 300.0), None).buttons, vec![], "even zoomed");
+        l.float(A, Rect::new(300.0, 200.0, 200.0, 150.0));
+        let s = scene(&l, 800.0, 600.0, false, &m());
+        let g = s.guides(&l, A, Point::new(24.0, 300.0), None);
+        assert_eq!((g.target, g.buttons.len(), g.active), (None, 4, Some(Drop::Window(Edge::Left))));
+    }
+
+    #[test]
+    fn each_of_the_eight_guides_lands_the_card_exactly_where_its_preview_shows() {
+        let l = two_and_a_card(); // area (0, 30, 800, 540): A (0, 30, 400, 540), B (401, 30, 399, 540)
+        let s = scene(&l, 800.0, 600.0, false, &m());
+        let c = Point::new(600.5, 300.0); // B's center
+        let cases = [
+            (Point::new(c.x - STEP, c.y), Drop::Split(B, Edge::Left), Rect::new(401.0, 30.0, 199.0, 540.0)),
+            (Point::new(c.x + STEP, c.y), Drop::Split(B, Edge::Right), Rect::new(601.0, 30.0, 199.0, 540.0)),
+            (Point::new(c.x, c.y - STEP), Drop::Split(B, Edge::Top), Rect::new(401.0, 30.0, 399.0, 270.0)),
+            (Point::new(c.x, c.y + STEP), Drop::Split(B, Edge::Bottom), Rect::new(401.0, 301.0, 399.0, 269.0)),
+            (Point::new(24.0, 300.0), Drop::Window(Edge::Left), Rect::new(0.0, 30.0, 400.0, 540.0)),
+            (Point::new(776.0, 300.0), Drop::Window(Edge::Right), Rect::new(401.0, 30.0, 399.0, 540.0)),
+            (Point::new(400.0, 54.0), Drop::Window(Edge::Top), Rect::new(0.0, 30.0, 800.0, 270.0)),
+            (Point::new(400.0, 546.0), Drop::Window(Edge::Bottom), Rect::new(0.0, 301.0, 800.0, 269.0)),
+        ];
+        for (at, drop, lands) in cases {
+            assert_eq!(s.guides(&l, C, at, None).active, Some(drop), "guide at {at:?}");
+            assert_eq!(l.drop_preview(s.area, 1.0, C, drop), lands, "preview of {drop:?}");
+            let mut after = l.clone();
+            after.apply(C, drop);
+            let placed = after.tiles(s.area, 1.0).into_iter().find(|(p, _)| *p == C).unwrap().1;
+            assert_eq!(placed, lands, "landing of {drop:?}");
+            assert_eq!(after.floats(s.area), vec![], "{drop:?} docked the card");
+        }
+    }
+
+    #[test]
+    fn each_guide_lands_a_dragged_tile_exactly_where_its_preview_shows() {
+        let l = two_and_a_card(); // A (0, 30, 400, 540), B (401, 30, 399, 540); A leaves, B fills the area
+        let s = scene(&l, 800.0, 600.0, false, &m());
+        let c = Point::new(600.5, 300.0); // B's center
+        let cases = [
+            (Point::new(c.x - STEP, c.y), Drop::Split(B, Edge::Left), Rect::new(0.0, 30.0, 400.0, 540.0)),
+            (Point::new(c.x + STEP, c.y), Drop::Split(B, Edge::Right), Rect::new(401.0, 30.0, 399.0, 540.0)),
+            (Point::new(c.x, c.y - STEP), Drop::Split(B, Edge::Top), Rect::new(0.0, 30.0, 800.0, 270.0)),
+            (Point::new(c.x, c.y + STEP), Drop::Split(B, Edge::Bottom), Rect::new(0.0, 301.0, 800.0, 269.0)),
+            (c, Drop::Swap(B), Rect::new(401.0, 30.0, 399.0, 540.0)),
+        ];
+        for (at, drop, lands) in cases {
+            assert_eq!(s.guides(&l, A, at, None).active, Some(drop), "guide at {at:?}");
+            assert_eq!(l.drop_preview(s.area, 1.0, A, drop), lands, "preview of {drop:?}");
+            let mut after = l.clone();
+            after.apply(A, drop);
+            let placed = after.tiles(s.area, 1.0).into_iter().find(|(p, _)| *p == A).unwrap().1;
+            assert_eq!(placed, lands, "landing of {drop:?}");
+        }
     }
 
     #[test]
