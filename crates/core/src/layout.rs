@@ -66,7 +66,6 @@ struct Split {
     second: Node,
 }
 
-/// A floating pane and where it was tiled before it floated.
 /// Where a dragged pane lands.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Drop {
@@ -88,6 +87,7 @@ pub struct Divider {
     pub rect: Rect,
 }
 
+/// A floating pane and where it was tiled before it floated.
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct Floating {
     pane: PaneId,
@@ -151,10 +151,15 @@ impl Layout {
             self.detach(pane).map(|d| d.neighbor)
         };
         self.changed();
-        neighbor.or_else(|| self.floating.last().map(|f| f.pane)).or_else(|| self.first_tile())
+        // While a tile is zoomed it is the only visible tile, so it stands in for every other.
+        let neighbor = neighbor.map(|n| self.zoomed.unwrap_or(n));
+        neighbor.or_else(|| self.floating.last().map(|f| f.pane)).or_else(|| self.first_visible_tile())
     }
 
-    fn first_tile(&self) -> Option<PaneId> {
+    fn first_visible_tile(&self) -> Option<PaneId> {
+        if self.zoomed.is_some() {
+            return self.zoomed;
+        }
         let mut node = self.root.as_ref()?;
         loop {
             match node {
@@ -196,6 +201,7 @@ impl Layout {
     /// Moves divider `index` so its gap is centered at `at` (an x for side-by-side splits, a
     /// y for stacked ones), keeping both sides at least `min` long.
     pub fn drag_divider(&mut self, area: Rect, gap: f32, index: usize, at: f32, min: f32) {
+        assert!(min > 0.0, "min must be positive, or a ratio of 0 or 1 hides a tile: {min}");
         assert!(self.zoomed.is_none(), "dividers are hidden while zoomed");
         let root = self.root.as_mut().expect("a divider implies tiles");
         let found = root.split_at(area, gap, index, &mut 0);
@@ -239,18 +245,13 @@ impl Layout {
         }
     }
 
-    /// The zone `drop` covers in the current arrangement, for a preview.
-    pub fn drop_preview(&self, area: Rect, gap: f32, drop: Drop) -> Rect {
-        let tile = |pane| {
-            let tiles = self.tiles(area, gap);
-            tiles.into_iter().find(|(p, _)| *p == pane).unwrap_or_else(|| panic!("{pane:?} is not visible")).1
-        };
-        match drop {
-            Drop::Split(target, edge) => half(tile(target), edge, gap),
-            Drop::Swap(target) => tile(target),
-            Drop::Window(_) if self.root.is_none() => area,
-            Drop::Window(edge) => half(area, edge, gap),
-        }
+    /// Where `pane` would sit after `apply(pane, drop)`, for a preview that matches the landing
+    /// exactly (ADR 6): the dragged pane leaves its old place and zoom resets first.
+    pub fn drop_preview(&self, area: Rect, gap: f32, pane: PaneId, drop: Drop) -> Rect {
+        let mut after = self.clone();
+        after.apply(pane, drop);
+        let tiles = after.tiles(area, gap);
+        tiles.into_iter().find(|(p, _)| *p == pane).expect("apply tiles the pane").1
     }
 
     /// Moves tiled or floating `pane` to `drop`, as computed by `drop_target` for this
@@ -537,16 +538,12 @@ fn nearest_edge(p: Point, r: Rect) -> (f32, Edge) {
         .fold((f32::INFINITY, Edge::Left), |best, c| if c.0 < best.0 { c } else { best })
 }
 
-/// The half of `r` touching `edge`, as a fresh 50% split would produce it.
-fn half(r: Rect, edge: Edge, gap: f32) -> Rect {
-    let (first, second) = cut(r, edge.axis(), 0.5, gap);
-    if edge.is_leading() { first } else { second }
-}
-
-/// `r` shrunk to fit `area` if needed, then shifted so it lies inside `area`.
+/// `r` shrunk to fit `area` if needed (never below zero), then shifted so it lies inside
+/// `area`. Not `f32::clamp`: rounding can put `area.right() - w` a hair below `area.x`, and
+/// clamp panics when min > max; the left/top edge wins then.
 fn keep_inside(r: Rect, area: Rect) -> Rect {
-    let (w, h) = (r.w.min(area.w), r.h.min(area.h));
-    Rect::new(r.x.clamp(area.x, area.right() - w), r.y.clamp(area.y, area.bottom() - h), w, h)
+    let (w, h) = (r.w.min(area.w).max(0.0), r.h.min(area.h).max(0.0));
+    Rect::new(r.x.min(area.right() - w).max(area.x), r.y.min(area.bottom() - h).max(area.y), w, h)
 }
 
 /// Cuts `r` along `axis` into two parts separated by `gap`; the first part gets `ratio` of
@@ -602,6 +599,17 @@ mod tests {
     }
 
     #[test]
+    fn closing_a_pane_while_a_tile_is_zoomed_focuses_the_zoomed_tile() {
+        let mut l = abc();
+        l.toggle_zoom(B);
+        assert_eq!(l.remove(C), Some(B), "C's tree neighbor A is hidden behind the zoom");
+        l.split(A, Edge::Bottom, C);
+        l.float(C, Rect::new(0.0, 0.0, 100.0, 100.0));
+        l.toggle_zoom(B);
+        assert_eq!(l.remove(C), Some(B), "no float left; the first tile A is hidden");
+    }
+
+    #[test]
     fn floating_a_tile_reflows_the_rest_and_embedding_returns_it_to_where_it_came_from() {
         let mut l = abc();
         let card = Rect::new(600.0, 20.0, 300.0, 200.0);
@@ -650,6 +658,17 @@ mod tests {
         assert_eq!(l.floats(AREA)[1], (A, Rect::new(800.0, 0.0, 200.0, 100.0)), "pushed back inside");
         let small = Rect::new(0.0, 0.0, 150.0, 80.0);
         assert_eq!(l.floats(small)[1], (A, Rect::new(0.0, 0.0, 150.0, 80.0)), "shrunk to fit");
+    }
+
+    #[test]
+    fn cards_are_kept_inside_fractional_areas_and_never_get_a_negative_size() {
+        let mut l = abc();
+        l.float(B, Rect::new(0.0, 0.0, 1.0, 1.0));
+        let area = Rect::new(0.1, 0.0, 0.3, 50.0); // 0.1 + 0.3 - 0.3 < 0.1 in f32
+        let (_, r) = l.floats(area)[0];
+        assert!(r.x >= area.x && r.right() <= area.right() + 1e-6, "{r:?}");
+        l.move_float(B, Rect::new(10.0, 10.0, -5.0, -5.0));
+        assert_eq!(l.floats(AREA)[0].1, Rect::new(10.0, 10.0, 0.0, 0.0));
     }
 
     #[test]
@@ -736,6 +755,12 @@ mod tests {
     }
 
     #[test]
+    #[should_panic(expected = "min must be positive")]
+    fn a_divider_drag_needs_a_positive_minimum_so_no_tile_collapses() {
+        abc().drag_divider(AREA, 0.0, 1, 0.0, 0.0);
+    }
+
+    #[test]
     fn dragging_a_tile_targets_pane_edges_centers_for_swap_and_window_edges() {
         let l = abc(); // A (0,0,500,300)  B (500,0,500,300)  C (0,300,1000,300)
         let at = |x, y| l.drop_target(AREA, 0.0, 24.0, Point::new(x, y), A);
@@ -765,15 +790,28 @@ mod tests {
         l.float(A, Rect::new(0.0, 0.0, 100.0, 100.0));
         assert_eq!(l.drop_target(AREA, 0.0, 24.0, Point::new(5.0, 300.0), A), Some(Drop::Window(Edge::Left)));
         assert_eq!(l.drop_target(AREA, 0.0, 24.0, Point::new(500.0, 300.0), A), None);
-        assert_eq!(l.drop_preview(AREA, 0.0, Drop::Window(Edge::Left)), AREA, "it will fill the area");
+        assert_eq!(l.drop_preview(AREA, 0.0, A, Drop::Window(Edge::Left)), AREA, "it will fill the area");
     }
 
     #[test]
     fn drop_previews_show_the_half_or_whole_tile_the_pane_will_take() {
         let l = abc();
-        assert_eq!(l.drop_preview(AREA, 0.0, Drop::Split(C, Edge::Left)), Rect::new(0.0, 300.0, 500.0, 300.0));
-        assert_eq!(l.drop_preview(AREA, 0.0, Drop::Swap(B)), Rect::new(500.0, 0.0, 500.0, 300.0));
-        assert_eq!(l.drop_preview(AREA, 0.0, Drop::Window(Edge::Top)), Rect::new(0.0, 0.0, 1000.0, 300.0));
+        assert_eq!(l.drop_preview(AREA, 0.0, A, Drop::Split(C, Edge::Left)), Rect::new(0.0, 300.0, 500.0, 300.0));
+        assert_eq!(l.drop_preview(AREA, 0.0, A, Drop::Swap(B)), Rect::new(500.0, 0.0, 500.0, 300.0));
+        assert_eq!(l.drop_preview(AREA, 0.0, A, Drop::Window(Edge::Top)), Rect::new(0.0, 0.0, 1000.0, 300.0));
+    }
+
+    #[test]
+    fn a_drop_preview_is_exactly_where_the_pane_lands() {
+        let mut l = Layout::default();
+        l.split_window(Edge::Right, A);
+        l.split(A, Edge::Right, B); // A (0,0,500,600)  B (500,0,500,600)
+        let drop = l.drop_target(AREA, 0.0, 24.0, Point::new(530.0, 300.0), A).unwrap();
+        assert_eq!(drop, Drop::Split(B, Edge::Left));
+        let preview = l.drop_preview(AREA, 0.0, A, drop);
+        assert_eq!(preview, Rect::new(0.0, 0.0, 500.0, 600.0), "B fills A's old space first, then splits");
+        l.apply(A, drop);
+        assert_eq!(rect_of(&l, A), preview);
     }
 
     #[test]

@@ -164,7 +164,8 @@ pub fn tile(pane: PaneId, outer: Rect, m: &Metrics) -> Frame {
     frame(pane, outer, &TILE_BUTTONS, m)
 }
 
-/// Splits `outer` into header and content and lays `buttons` out right-aligned in the header.
+/// Splits `outer` into header and content and lays `buttons` out right-aligned in the header,
+/// dropping those that do not fit whole, leftmost first, so Close survives longest.
 fn frame(pane: PaneId, outer: Rect, buttons: &[PaneButton], m: &Metrics) -> Frame {
     let header = Rect::new(outer.x, outer.y, outer.w, m.header.min(outer.h));
     let content = Rect::new(outer.x, header.bottom(), outer.w, outer.bottom() - header.bottom());
@@ -178,6 +179,7 @@ fn frame(pane: PaneId, outer: Rect, buttons: &[PaneButton], m: &Metrics) -> Fram
             let x = header.right() - from_right * (m.button + inset);
             (*b, Rect::new(x, header.y + inset, m.button, m.button))
         })
+        .filter(|(_, r)| r.x >= header.x && r.bottom() <= header.bottom())
         .collect();
     Frame { pane, outer, header, content, buttons }
 }
@@ -192,6 +194,10 @@ impl Scene {
         for f in self.cards.iter().rev() {
             if !f.outer.contains(p) {
                 continue;
+            }
+            // Buttons sit inside the resize bands near the top-right corner; they win there.
+            if let Some((b, _)) = f.buttons.iter().find(|(_, r)| r.contains(p)) {
+                return Hit::Button(f.pane, *b);
             }
             let g = m.resize_grab;
             let o = f.outer;
@@ -316,6 +322,28 @@ mod tests {
         assert_eq!(s.hit(Point::new(498.0, 348.0)), Hit::Resize(C, both));
         let left = Resize { left: true, right: false, top: false, bottom: false };
         assert_eq!(s.hit(Point::new(301.0, 300.0)), Hit::Resize(C, left));
+    }
+
+    #[test]
+    fn card_buttons_take_clicks_before_the_resize_band_they_sit_in() {
+        let s = scene(&busy(), 800.0, 600.0, false, &m());
+        let close = s.cards[0].buttons[2].1;
+        let corner = Point::new(close.right() - 1.0, close.y + 1.0); // inside the top and right bands
+        assert_eq!(s.hit(corner), Hit::Button(C, PaneButton::Close));
+        assert_eq!(
+            s.hit(Point::new(499.0, 201.0)),
+            Hit::Resize(C, Resize { right: true, top: true, ..Resize::default() })
+        );
+    }
+
+    #[test]
+    fn a_header_too_small_for_every_button_keeps_only_those_that_fit_from_the_right() {
+        let narrow = scene(&one(), 60.0, 600.0, false, &m());
+        let f = &narrow.tiles[0];
+        let order: Vec<PaneButton> = f.buttons.iter().map(|b| b.0).collect();
+        assert_eq!(order, vec![PaneButton::Zoom, PaneButton::Close]);
+        let short = scene(&one(), 800.0, 30.0 + 30.0 + 15.0, false, &m());
+        assert_eq!(short.tiles[0].buttons, vec![], "a 15 px header cannot hold an 18 px button");
     }
 
     #[test]

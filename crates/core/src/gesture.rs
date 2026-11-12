@@ -49,7 +49,24 @@ pub enum Effect {
 }
 
 impl Gesture {
-    pub fn press(&mut self, on: Hit, at: Point) -> Effect {
+    /// Ends whatever gesture is active without completing it, for when the release will never
+    /// come (the window lost focus): a pane drag is cancelled, a terminal gets its release.
+    pub fn abort(&mut self) -> Effect {
+        let effect = match *self {
+            Gesture::DraggingPane(p) => Effect::CancelDrag(p),
+            Gesture::Terminal(p) => Effect::TerminalRelease(p),
+            Gesture::Pressed { .. } | Gesture::ResizingCard(..) | Gesture::DraggingDivider(_) | Gesture::Idle => {
+                Effect::None
+            }
+        };
+        *self = Gesture::Idle;
+        effect
+    }
+
+    /// A primary-button press; other buttons must not come here. Returns the effect that ends
+    /// a gesture whose release was lost (see `abort`), then the effect of this press.
+    pub fn press(&mut self, on: Hit, at: Point) -> [Effect; 2] {
+        let stale = self.abort();
         let (next, effect) = match on {
             Hit::Header(p) => (Gesture::Pressed { on, at }, Effect::Focus(p)),
             Hit::Button(..) | Hit::Chip(_) | Hit::Chrome(_) => (Gesture::Pressed { on, at }, Effect::None),
@@ -60,7 +77,7 @@ impl Gesture {
             Hit::Nothing => (Gesture::Idle, Effect::None),
         };
         *self = next;
-        effect
+        [stale, effect]
     }
 
     /// `threshold` is the travel that turns a header press into a drag.
@@ -115,17 +132,40 @@ mod tests {
     use super::*;
 
     const A: PaneId = PaneId(1);
+    const B: PaneId = PaneId(2);
     const O: Point = Point::new(10.0, 10.0);
 
     #[test]
     fn a_header_press_focuses_and_becomes_a_pane_drag_past_the_threshold() {
         let mut g = Gesture::Idle;
-        assert_eq!(g.press(Hit::Header(A), O), Effect::Focus(A));
+        assert_eq!(g.press(Hit::Header(A), O), [Effect::None, Effect::Focus(A)]);
         assert_eq!(g.moved(Point::new(12.0, 11.0), 4.0), Effect::None);
         assert_eq!(g.moved(Point::new(14.0, 10.0), 4.0), Effect::DragStart(A));
         assert_eq!(g.moved(Point::new(50.0, 50.0), 4.0), Effect::DragMove(A));
         assert_eq!(g.release(Hit::Nothing), Effect::Drop(A));
         assert_eq!(g, Gesture::Idle);
+    }
+
+    #[test]
+    fn losing_focus_aborts_a_drag_or_releases_the_terminal() {
+        let mut g = Gesture::Idle;
+        g.press(Hit::Header(A), O);
+        g.moved(Point::new(50.0, 50.0), 4.0);
+        assert_eq!(g.abort(), Effect::CancelDrag(A));
+        assert_eq!(g, Gesture::Idle);
+        g.press(Hit::Content(A), O);
+        assert_eq!(g.abort(), Effect::TerminalRelease(A));
+        assert_eq!(g.release(Hit::Nothing), Effect::None, "already ended");
+        g.press(Hit::Divider(0), O);
+        assert_eq!(g.abort(), Effect::None);
+        assert_eq!(g, Gesture::Idle);
+    }
+
+    #[test]
+    fn a_press_after_a_lost_release_first_ends_the_stale_gesture() {
+        let mut g = Gesture::Idle;
+        g.press(Hit::Content(A), O);
+        assert_eq!(g.press(Hit::Header(B), O), [Effect::TerminalRelease(A), Effect::Focus(B)]);
     }
 
     #[test]
@@ -149,7 +189,7 @@ mod tests {
     fn a_border_press_resizes_the_card_on_every_move_and_raises_it_first() {
         let mut g = Gesture::Idle;
         let r = Resize { right: true, ..Resize::default() };
-        assert_eq!(g.press(Hit::Resize(A, r), O), Effect::Focus(A));
+        assert_eq!(g.press(Hit::Resize(A, r), O), [Effect::None, Effect::Focus(A)]);
         assert_eq!(g.moved(Point::new(11.0, 10.0), 4.0), Effect::ResizeCard(A, r));
         assert_eq!(g.release(Hit::Nothing), Effect::None);
     }
@@ -157,7 +197,7 @@ mod tests {
     #[test]
     fn a_divider_press_resizes_tiles_on_every_move() {
         let mut g = Gesture::Idle;
-        assert_eq!(g.press(Hit::Divider(2), O), Effect::None);
+        assert_eq!(g.press(Hit::Divider(2), O), [Effect::None, Effect::None]);
         assert_eq!(g.moved(Point::new(11.0, 10.0), 4.0), Effect::ResizeDivider(2));
         assert_eq!(g.release(Hit::Nothing), Effect::None);
     }
@@ -165,7 +205,7 @@ mod tests {
     #[test]
     fn a_terminal_press_captures_the_pointer_until_release() {
         let mut g = Gesture::Idle;
-        assert_eq!(g.press(Hit::Content(A), O), Effect::TerminalPress(A));
+        assert_eq!(g.press(Hit::Content(A), O), [Effect::None, Effect::TerminalPress(A)]);
         assert_eq!(g.moved(Point::new(500.0, 0.0), 4.0), Effect::TerminalMotion(A));
         assert_eq!(g.release(Hit::Nothing), Effect::TerminalRelease(A));
     }
@@ -173,7 +213,7 @@ mod tests {
     #[test]
     fn a_press_on_the_empty_top_bar_hands_the_drag_to_the_system() {
         let mut g = Gesture::Idle;
-        assert_eq!(g.press(Hit::DragWindow, O), Effect::DragWindow);
+        assert_eq!(g.press(Hit::DragWindow, O), [Effect::None, Effect::DragWindow]);
         assert_eq!(g, Gesture::Idle, "the system owns the rest of this drag");
     }
 
