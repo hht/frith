@@ -9,6 +9,8 @@
 //! header buttons only while the pane is focused or hovered. Cards are rounded, bordered and
 //! shadowed above the tiles.
 
+use frith_core::colors::{Chrome, Tint};
+use frith_core::config::Rgb;
 use frith_core::geom::{Point, Rect};
 use frith_core::layout::{Divider, Drop, Edge, PaneId};
 use frith_core::scene::{ChromeButton, Frame, Guides, Hit, PaneButton, Scene};
@@ -18,25 +20,13 @@ use skia_safe::{
 
 use crate::fonts::{Fonts, Glyph};
 
-pub mod theme {
-    use skia_safe::Color;
-    pub const WINDOW: Color = Color::from_rgb(15, 17, 24);
-    pub const BAR: Color = Color::from_rgb(20, 22, 31);
-    pub const HEADER: Color = Color::from_rgb(24, 27, 37);
-    pub const HEADER_FOCUSED: Color = Color::from_rgb(31, 35, 50);
-    pub const LINE: Color = Color::from_rgb(46, 50, 66);
-    pub const TEXT: Color = Color::from_rgb(222, 226, 240);
-    pub const TEXT_DIM: Color = Color::from_rgb(132, 138, 160);
-    pub const ACCENT: Color = Color::from_rgb(110, 150, 255);
-    pub const ATTENTION: Color = Color::from_rgb(255, 184, 77);
-    pub const HOVER: Color = Color::from_argb(40, 255, 255, 255);
-    pub const CHIP: Color = Color::from_argb(26, 255, 255, 255);
-    pub const CARD_BORDER: Color = Color::from_argb(56, 255, 255, 255);
-    pub const SHADOW: Color = Color::from_argb(150, 0, 0, 0);
-    pub const PREVIEW: Color = Color::from_argb(64, 110, 150, 255);
-    pub const LABEL: Color = Color::from_rgb(38, 44, 66);
-    pub const PREEDIT: Color = Color::from_rgb(40, 44, 60);
-    pub const PREEDIT_INK: Color = Color::from_rgb(255, 214, 102);
+/// A chrome color for Skia.
+fn col(c: Rgb) -> Color {
+    Color::from_rgb(c.r, c.g, c.b)
+}
+
+fn tint(t: Tint) -> Color {
+    Color::from_argb(t.alpha, t.rgb.r, t.rgb.g, t.rgb.b)
 }
 
 fn sk(r: Rect) -> SkRect {
@@ -46,6 +36,7 @@ fn sk(r: Rect) -> SkRect {
 /// What chrome is painted with this frame.
 pub struct Pen<'a> {
     pub canvas: &'a Canvas,
+    pub chrome: &'a Chrome,
     pub fonts: &'a mut Fonts,
     /// Physical pixels per logical pixel.
     pub scale: f32,
@@ -62,26 +53,28 @@ pub struct PaneLook<'a> {
 }
 
 pub fn background(pen: &Pen, scene: &Scene) {
+    let c = pen.chrome;
     let canvas = pen.canvas;
-    canvas.clear(theme::WINDOW);
+    canvas.clear(col(c.bar));
     let mut p = Paint::default();
-    p.set_color(theme::BAR);
+    p.set_color(col(c.bar));
     canvas.draw_rect(sk(scene.top), &p);
     canvas.draw_rect(sk(scene.bar), &p);
     if let Some(side) = scene.sidebar {
         canvas.draw_rect(sk(side), &p);
-        p.set_color(theme::LINE);
+        p.set_color(col(c.line));
         canvas.draw_rect(SkRect::from_xywh(side.right() - scene.metrics.gap, side.y, scene.metrics.gap, side.h), &p);
     }
 }
 
 /// Top bar: chrome buttons and the focused pane's title, centered.
 pub fn top_bar(pen: &mut Pen, scene: &Scene, title: &str, hover: Hit) {
+    let c = pen.chrome;
     let (canvas, scale) = (pen.canvas, pen.scale);
     let fonts = &mut *pen.fonts;
     for &(b, r) in &scene.chrome {
-        button_back(canvas, r, hover == Hit::Chrome(b));
-        let mut p = stroke(theme::TEXT_DIM, scale);
+        button_back(canvas, c, r, hover == Hit::Chrome(b));
+        let mut p = stroke(col(c.text_dim), scale);
         let (cx, cy, s) = (r.x + r.w / 2.0, r.y + r.h / 2.0, r.w * 0.28);
         match b {
             ChromeButton::Sidebar => {
@@ -98,18 +91,19 @@ pub fn top_bar(pen: &mut Pen, scene: &Scene, title: &str, hover: Hit) {
     }
     let w = text_width(fonts, title).min(scene.top.w / 2.0);
     let x = (scene.top.x + (scene.top.w - w) / 2.0).round();
-    label(canvas, fonts, title, x, scene.top, w, theme::TEXT_DIM);
+    label(canvas, fonts, title, x, scene.top, w, col(c.text_dim));
 }
 
 /// A tile's header strip (the grid is drawn separately), with buttons only while the pane
 /// is focused or hovered.
 pub fn tile_header(pen: &mut Pen, f: &Frame, look: &PaneLook, hover: Hit) {
+    let c = pen.chrome;
     let (canvas, scale) = (pen.canvas, pen.scale);
     let mut p = Paint::default();
-    p.set_color(if look.focused { theme::HEADER_FOCUSED } else { theme::HEADER });
+    p.set_color(if look.focused { col(c.header_focused) } else { col(c.header) });
     canvas.draw_rect(sk(f.header), &p);
     if look.focused {
-        p.set_color(theme::ACCENT);
+        p.set_color(col(c.accent));
         canvas.draw_rect(SkRect::from_xywh(f.header.x, f.header.bottom() - scale, f.header.w, scale), &p);
     }
     header_content(pen, f, look, hover, look.focused || look.hovered);
@@ -117,22 +111,24 @@ pub fn tile_header(pen: &mut Pen, f: &Frame, look: &PaneLook, hover: Hit) {
 
 /// Everything below the tiles' grids: the 1 px lines between tiles, `lit` in the accent.
 pub fn dividers(pen: &Pen, dividers: &[Divider], lit: Option<usize>) {
+    let c = pen.chrome;
     let canvas = pen.canvas;
     let mut p = Paint::default();
     for d in dividers {
-        p.set_color(if Some(d.index) == lit { theme::ACCENT } else { theme::LINE });
+        p.set_color(if Some(d.index) == lit { col(c.accent) } else { col(c.line) });
         canvas.draw_rect(sk(d.rect), &p);
     }
 }
 
 /// Shown when every pane floats or is minimized (ADR 6).
 pub fn empty_state(pen: &mut Pen, area: Rect) {
+    let c = pen.chrome;
     let canvas = pen.canvas;
     let fonts = &mut *pen.fonts;
     let text = "No tiled panes. Drag a card to an edge, or press ⌘D.";
     let w = text_width(fonts, text).min(area.w);
     let line = Rect::new(area.x, area.y + area.h / 2.0 - fonts.cell_h, area.w, fonts.cell_h * 2.0);
-    label(canvas, fonts, text, (area.x + (area.w - w) / 2.0).round(), line, w, theme::TEXT_DIM);
+    label(canvas, fonts, text, (area.x + (area.w - w) / 2.0).round(), line, w, col(c.text_dim));
 }
 
 /// Card radius in physical pixels.
@@ -143,10 +139,11 @@ fn radius(scale: f32) -> f32 {
 /// The card's shadow, then a clip to its rounded frame for the grid and header; pair with
 /// `card_over`.
 pub fn card_under(pen: &Pen, f: &Frame) {
+    let c = pen.chrome;
     let (canvas, scale) = (pen.canvas, pen.scale);
     let rr = RRect::new_rect_xy(sk(f.outer), radius(scale), radius(scale));
     let mut p = Paint::default();
-    p.set_anti_alias(true).set_color(theme::SHADOW);
+    p.set_anti_alias(true).set_color(tint(c.shadow));
     p.set_mask_filter(MaskFilter::blur(skia_safe::BlurStyle::Normal, 12.0 * scale, false));
     canvas.draw_rrect(rr.with_offset((0.0, 6.0 * scale)), &p);
     canvas.save();
@@ -155,19 +152,21 @@ pub fn card_under(pen: &Pen, f: &Frame) {
 
 /// The card's header, the end of its clip, and its border; the focused card's is the accent.
 pub fn card_over(pen: &mut Pen, f: &Frame, look: &PaneLook, hover: Hit) {
+    let c = pen.chrome;
     let (canvas, scale) = (pen.canvas, pen.scale);
     let mut p = Paint::default();
-    p.set_color(if look.focused { theme::HEADER_FOCUSED } else { theme::HEADER });
+    p.set_color(if look.focused { col(c.header_focused) } else { col(c.header) });
     canvas.draw_rect(sk(f.header), &p);
     header_content(pen, f, look, hover, true);
     canvas.restore();
     let rr = RRect::new_rect_xy(sk(f.outer), radius(scale), radius(scale));
-    let border = if look.focused { theme::ACCENT } else { theme::CARD_BORDER };
+    let border = if look.focused { col(c.accent) } else { tint(c.card_border) };
     canvas.draw_rrect(rr, &stroke(border, scale));
 }
 
 /// Attention dot, title, and (when `buttons`) the header buttons.
 fn header_content(pen: &mut Pen, f: &Frame, look: &PaneLook, hover: Hit, buttons: bool) {
+    let c = pen.chrome;
     let (canvas, scale) = (pen.canvas, pen.scale);
     let fonts = &mut *pen.fonts;
     let inset = (6.0 * scale).round();
@@ -175,26 +174,26 @@ fn header_content(pen: &mut Pen, f: &Frame, look: &PaneLook, hover: Hit, buttons
     if look.attention {
         let r = 3.0 * scale;
         let mut p = Paint::default();
-        p.set_anti_alias(true).set_color(theme::ATTENTION);
+        p.set_anti_alias(true).set_color(col(c.attention));
         canvas.draw_circle((x + r, f.header.y + f.header.h / 2.0), r, &p);
         x += r * 2.0 + inset;
     }
     let right = if buttons { f.buttons.first().map_or(f.header.right(), |(_, r)| r.x) } else { f.header.right() };
-    let ink = if look.focused { theme::TEXT } else { theme::TEXT_DIM };
+    let ink = if look.focused { col(c.text) } else { col(c.text_dim) };
     label(canvas, fonts, look.title, x, f.header, right - inset - x, ink);
     if !buttons {
         return;
     }
     for &(b, r) in &f.buttons {
-        button_back(canvas, r, hover == Hit::Button(f.pane, b));
+        button_back(canvas, c, r, hover == Hit::Button(f.pane, b));
         icon(canvas, b, r, look.zoomed, ink, scale);
     }
 }
 
-fn button_back(canvas: &Canvas, r: Rect, hovered: bool) {
+fn button_back(canvas: &Canvas, c: &Chrome, r: Rect, hovered: bool) {
     if hovered {
         let mut p = Paint::default();
-        p.set_anti_alias(true).set_color(theme::HOVER);
+        p.set_anti_alias(true).set_color(tint(c.hover));
         canvas.draw_round_rect(sk(r), r.w / 4.0, r.w / 4.0, &p);
     }
 }
@@ -254,6 +253,7 @@ fn icon(canvas: &Canvas, b: PaneButton, r: Rect, zoomed: bool, ink: Color, scale
 
 /// The dock bar's chips: one per minimized pane, with its title and attention dot.
 pub fn dock(pen: &mut Pen, scene: &Scene, look: impl Fn(PaneId) -> (String, bool), hover: Hit) {
+    let c = pen.chrome;
     let (canvas, scale) = (pen.canvas, pen.scale);
     let fonts = &mut *pen.fonts;
     let mut p = Paint::default();
@@ -261,16 +261,16 @@ pub fn dock(pen: &mut Pen, scene: &Scene, look: impl Fn(PaneId) -> (String, bool
     for &(pane, r) in &scene.chips {
         let (title, attention) = look(pane);
         let rad = r.h / 2.0;
-        p.set_color(if hover == Hit::Chip(pane) { theme::HOVER } else { theme::CHIP });
+        p.set_color(if hover == Hit::Chip(pane) { tint(c.hover) } else { tint(c.chip) });
         canvas.draw_round_rect(sk(r), rad, rad, &p);
         let mut x = r.x + rad;
         if attention {
             let d = 3.0 * scale;
-            p.set_color(theme::ATTENTION);
+            p.set_color(col(c.attention));
             canvas.draw_circle((x + d, r.y + r.h / 2.0), d, &p);
             x += d * 3.0;
         }
-        label(canvas, fonts, &title, x, r, r.right() - rad - x, theme::TEXT);
+        label(canvas, fonts, &title, x, r, r.right() - rad - x, col(c.text));
     }
 }
 
@@ -279,6 +279,7 @@ pub fn dock(pen: &mut Pen, scene: &Scene, look: impl Fn(PaneId) -> (String, bool
 /// the drop does), and the guides themselves above everything else. The label sits beside
 /// the pointer and flips to its other side where it would leave the window.
 pub fn dock_guides(pen: &mut Pen, scene: &Scene, guides: &Guides, preview: Option<(Rect, &str)>, at: Point) {
+    let c = pen.chrome;
     let (canvas, scale) = (pen.canvas, pen.scale);
     let fonts = &mut *pen.fonts;
     if let Some(f) = guides.target.and_then(|t| scene.tiles.iter().find(|f| f.pane == t)) {
@@ -286,17 +287,17 @@ pub fn dock_guides(pen: &mut Pen, scene: &Scene, guides: &Guides, preview: Optio
         let inset = scale;
         canvas.draw_rect(
             SkRect::from_xywh(o.x + inset, o.y + inset, o.w - 2.0 * inset, o.h - 2.0 * inset),
-            &stroke(theme::ACCENT, 2.0 * scale),
+            &stroke(col(c.accent), 2.0 * scale),
         );
     }
     if let Some((zone, _)) = preview {
         let mut p = Paint::default();
-        p.set_color(theme::PREVIEW).set_blend_mode(BlendMode::SrcOver);
+        p.set_color(tint(c.preview)).set_blend_mode(BlendMode::SrcOver);
         canvas.draw_rect(sk(zone), &p);
-        canvas.draw_rect(sk(zone), &stroke(theme::ACCENT, 2.0 * scale));
+        canvas.draw_rect(sk(zone), &stroke(col(c.accent), 2.0 * scale));
     }
     for &(drop, r) in &guides.buttons {
-        guide(canvas, drop, r, guides.active == Some(drop), scale);
+        guide(canvas, c, drop, r, guides.active == Some(drop), scale);
     }
     let Some((_, text)) = preview else { return };
     let bounds = Rect::new(0.0, 0.0, scene.top.w, scene.bar.bottom());
@@ -307,22 +308,22 @@ pub fn dock_guides(pen: &mut Pen, scene: &Scene, guides: &Guides, preview: Optio
     let y = if at.y + off + h <= bounds.bottom() { at.y + off } else { at.y - off - h };
     let r = Rect::new(x, y, w, h);
     let mut back = Paint::default();
-    back.set_anti_alias(true).set_color(theme::LABEL);
+    back.set_anti_alias(true).set_color(col(c.raised));
     canvas.draw_round_rect(sk(r), h / 2.0, h / 2.0, &back);
-    canvas.draw_round_rect(sk(r), h / 2.0, h / 2.0, &stroke(theme::ACCENT, scale));
-    label(canvas, fonts, text, r.x + pad, r, r.w - pad, theme::TEXT);
+    canvas.draw_round_rect(sk(r), h / 2.0, h / 2.0, &stroke(col(c.accent), scale));
+    label(canvas, fonts, text, r.x + pad, r, r.w - pad, col(c.text));
 }
 
 /// One guide: a rounded square holding a small pane outline with the part the dragged pane
 /// takes filled in: half of it for a split, a narrow strip along the edge for the whole
 /// window, all of it for a swap.
-fn guide(canvas: &Canvas, drop: Drop, r: Rect, active: bool, scale: f32) {
+fn guide(canvas: &Canvas, c: &Chrome, drop: Drop, r: Rect, active: bool, scale: f32) {
     let rad = 6.0 * scale;
     let mut back = Paint::default();
-    back.set_anti_alias(true).set_color(if active { theme::ACCENT } else { theme::LABEL });
+    back.set_anti_alias(true).set_color(if active { col(c.accent) } else { col(c.raised) });
     canvas.draw_round_rect(sk(r), rad, rad, &back);
-    canvas.draw_round_rect(sk(r), rad, rad, &stroke(theme::CARD_BORDER, scale));
-    let ink = if active { theme::WINDOW } else { theme::ACCENT };
+    canvas.draw_round_rect(sk(r), rad, rad, &stroke(tint(c.card_border), scale));
+    let ink = if active { col(c.on_accent) } else { col(c.accent) };
     let i = (r.w * 0.24).round();
     let b = Rect::new(r.x + i, r.y + i, r.w - 2.0 * i, r.h - 2.0 * i);
     let (edge, part) = match drop {
@@ -343,8 +344,10 @@ fn guide(canvas: &Canvas, drop: Drop, r: Rect, active: bool, scale: f32) {
     canvas.draw_rect(sk(b), &stroke(ink, scale));
 }
 
-/// IME composition text over the cursor cell: a dark box, the text, and an underline.
+/// IME composition text over the cursor cell: a box in the focused header's color, the text,
+/// and an accent underline.
 pub fn preedit(pen: &mut Pen, at: SkRect, text: &str) {
+    let c = pen.chrome;
     let canvas = pen.canvas;
     let fonts = &mut *pen.fonts;
     if text.is_empty() {
@@ -352,10 +355,10 @@ pub fn preedit(pen: &mut Pen, at: SkRect, text: &str) {
     }
     let r = Rect::new(at.left, at.top, text_width(fonts, text), at.height());
     let mut p = Paint::default();
-    p.set_color(theme::PREEDIT);
+    p.set_color(col(c.header_focused));
     canvas.draw_rect(sk(r), &p);
-    label(canvas, fonts, text, r.x, r, f32::INFINITY, theme::PREEDIT_INK);
-    p.set_color(theme::PREEDIT_INK);
+    label(canvas, fonts, text, r.x, r, f32::INFINITY, col(c.text));
+    p.set_color(col(c.accent));
     canvas.draw_rect(SkRect::from_xywh(r.x, r.bottom() - 2.0, r.w, 2.0), &p);
 }
 

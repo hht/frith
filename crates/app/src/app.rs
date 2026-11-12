@@ -12,13 +12,14 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use frith_core::config::Config;
+use frith_core::colors::Chrome;
+use frith_core::config::{Config, Rgb};
 use frith_core::geom::{Point, Rect};
 use frith_core::gesture::{Effect, Gesture};
 use frith_core::layout::{Axis, Drop, Edge, Layout, PaneId};
 use frith_core::scene::{self, ChromeButton, Frame, Guides, Hit, Metrics, PaneButton, Resize, Scene};
 use libghostty_vt::mouse;
-use skia_safe::Rect as SkRect;
+use skia_safe::{Color, Rect as SkRect};
 use winit::application::ApplicationHandler;
 use winit::cursor::CursorIcon;
 use winit::dpi::{LogicalSize, PhysicalPosition, PhysicalSize};
@@ -35,7 +36,7 @@ use crate::fonts::Fonts;
 use crate::gpu::Gpu;
 use crate::grid::{self, Grid};
 use crate::pty::Program;
-use crate::render::{self, PaneLook, theme};
+use crate::render::{self, PaneLook};
 use crate::shell;
 use crate::term::{GridSize, Pad, Session};
 use crate::{Cfg, unescape};
@@ -98,6 +99,8 @@ pub struct App {
     config: Config,
     /// Where the shell integration is installed, checked before each shell starts.
     cache: PathBuf,
+    /// Chrome colors, from the terminal colors the config sets (ADR 14).
+    chrome: Chrome,
     proxy: EventLoopProxy,
     win: Option<Win>,
     sidebar: bool,
@@ -130,6 +133,7 @@ impl App {
     pub fn new(cfg: Cfg, config: Config, cache: PathBuf, proxy: EventLoopProxy) -> App {
         App {
             cfg,
+            chrome: chrome_for(&config),
             config,
             cache,
             proxy,
@@ -396,14 +400,15 @@ impl App {
         let hovered = hit_pane(self.hover);
         let pad = self.pad();
         let pad = (pad.left as f32, pad.top as f32);
-        let App { win, panes, layout, focus, hover, pointer, preedit, .. } = self;
+        let App { win, panes, layout, focus, hover, pointer, preedit, chrome, .. } = self;
+        let chrome = &*chrome;
         let layout = &*layout;
         let (focus, hover, pointer) = (*focus, *hover, *pointer);
         let w = win.as_mut().expect("window");
         let Win { gpu, fonts, atlas, scale, .. } = w;
         let scale = *scale;
         let cursor = gpu.present(shot.as_deref(), |canvas, ctx| {
-            let mut pen = render::Pen { canvas, fonts, scale };
+            let mut pen = render::Pen { canvas, chrome, fonts, scale };
             render::background(&pen, &scene);
             let mut cursor = None;
             let zoomed = layout.zoomed();
@@ -416,7 +421,13 @@ impl App {
                 let held = p.session.hold(now);
                 frame_due = [frame_due, held].into_iter().flatten().min();
                 let c = SkRect::from_xywh(f.content.x, f.content.y, f.content.w, f.content.h);
-                let look = grid::Look { content: c, pad, focused, cursor: theme::ACCENT, update: held.is_none() };
+                let look = grid::Look {
+                    content: c,
+                    pad,
+                    focused,
+                    cursor: Color::from_rgb(pen.chrome.accent.r, pen.chrome.accent.g, pen.chrome.accent.b),
+                    update: held.is_none(),
+                };
                 let at = p.grid.draw(canvas, pen.fonts, atlas, ctx, &p.session.term, &look);
                 if focused {
                     cursor = at;
@@ -984,4 +995,12 @@ impl ApplicationHandler for App {
         }
         self.settle(el);
     }
+}
+
+/// The chrome for the configured terminal colors. Palette 4 (blue) is the accent and 3
+/// (yellow) the attention color, at libghostty-vt's defaults unless configured.
+/// @see Ghostty `src/terminal/color.zig` (`Name.default`)
+fn chrome_for(config: &Config) -> Chrome {
+    let entry = |i: u8, r: u8, g: u8, b: u8| config.palette.get(&i).copied().unwrap_or(Rgb { r, g, b });
+    Chrome::derive(config.background, config.foreground, entry(4, 0x81, 0xa2, 0xbe), entry(3, 0xf0, 0xc6, 0x74))
 }
