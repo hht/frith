@@ -12,6 +12,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
+use frith_core::config::Config;
 use frith_core::geom::{Point, Rect};
 use frith_core::gesture::{Effect, Gesture};
 use frith_core::layout::{Axis, Drop, Edge, Layout, PaneId};
@@ -30,12 +31,12 @@ use winit::window::{
 };
 
 use crate::atlas::Atlas;
-use crate::fonts::{FontConfig, Fonts};
+use crate::fonts::Fonts;
 use crate::gpu::Gpu;
 use crate::grid::{self, Grid};
 use crate::pty::Program;
 use crate::render::{self, PaneLook, theme};
-use crate::term::{GridSize, Session};
+use crate::term::{GridSize, Pad, Session};
 use crate::{Cfg, unescape};
 
 /// Upper bound on PTY bytes parsed per pane per wake-up, so one flooding pane cannot starve
@@ -44,9 +45,6 @@ const FEED_BUDGET: usize = 1 << 20;
 
 // Sizes in logical pixels.
 const WINDOW: (f64, f64) = (1200.0, 800.0);
-const FONT_SIZE: f32 = 13.0;
-/// Space between a pane's content edge and its terminal grid.
-const GRID_PAD: f32 = 4.0;
 /// Pointer travel that turns a header press into a pane drag.
 const DRAG_THRESHOLD: f32 = 4.0;
 const MIN_TILE: f32 = 80.0;
@@ -96,6 +94,7 @@ struct Resizing {
 
 pub struct App {
     cfg: Cfg,
+    config: Config,
     proxy: EventLoopProxy,
     win: Option<Win>,
     sidebar: bool,
@@ -125,9 +124,10 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(cfg: Cfg, proxy: EventLoopProxy) -> App {
+    pub fn new(cfg: Cfg, config: Config, proxy: EventLoopProxy) -> App {
         App {
             cfg,
+            config,
             proxy,
             win: None,
             sidebar: false,
@@ -169,8 +169,21 @@ impl App {
 
     fn grid_size(&self, content: Rect) -> GridSize {
         let w = self.win();
-        let (f, pad) = (&w.fonts, w.px(GRID_PAD) as u32);
-        GridSize::fit(content.w as u32, content.h as u32, f.cell_w as u32, f.cell_h as u32, pad)
+        let f = &w.fonts;
+        GridSize::fit(content.w as u32, content.h as u32, f.cell_w as u32, f.cell_h as u32, self.pad())
+    }
+
+    /// The configured space between a pane's content edge and its grid, in physical pixels,
+    /// rounded down as Ghostty does. @see Ghostty `src/Surface.zig` (`scaledPadding`)
+    fn pad(&self) -> Pad {
+        let (scale, c) = (self.win().scale, &self.config);
+        let px = |points: f32| (points * scale).floor() as u32;
+        Pad {
+            left: px(c.padding_x.start),
+            top: px(c.padding_y.start),
+            right: px(c.padding_x.end),
+            bottom: px(c.padding_y.end),
+        }
     }
 
     // ---- window ------------------------------------------------------------------------
@@ -190,7 +203,7 @@ impl App {
         let gpu = Gpu::attach(window.as_ref());
         let scale = window.scale_factor() as f32;
         let size = window.surface_size();
-        let fonts = Fonts::new(&font_config(), FONT_SIZE * scale);
+        let fonts = Fonts::new(&self.config.font_family, self.config.font_size * scale);
         let atlas = Atlas::new(&fonts);
         window.request_redraw();
         let metrics = Metrics::for_scale(scale);
@@ -201,7 +214,7 @@ impl App {
         let w = self.win.as_mut().expect("window");
         w.scale = scale;
         w.metrics = Metrics::for_scale(scale);
-        w.fonts = Fonts::new(&font_config(), FONT_SIZE * scale);
+        w.fonts = Fonts::new(&self.config.font_family, self.config.font_size * scale);
         w.atlas = Atlas::new(&w.fonts);
         for p in self.panes.values_mut() {
             p.grid.invalidate();
@@ -224,7 +237,7 @@ impl App {
             Program::LoginShell => "shell".to_string(),
             Program::Command(c) => c.clone(),
         };
-        match Session::spawn(&program, &cwd, self.grid_size(content), move || proxy.wake_up()) {
+        match Session::spawn(&program, &cwd, self.grid_size(content), &self.config, move || proxy.wake_up()) {
             Ok(session) => {
                 let pane_state = Pane { session, grid: Grid::new(), title, attention: false };
                 self.panes.insert(pane, pane_state);
@@ -369,13 +382,14 @@ impl App {
         let title = self.focus.map(|p| self.panes[&p].title.clone()).unwrap_or_default();
         let shot = self.shot.take();
         let hovered = hit_pane(self.hover);
+        let pad = self.pad();
+        let pad = (pad.left as f32, pad.top as f32);
         let App { win, panes, layout, focus, hover, pointer, preedit, .. } = self;
         let layout = &*layout;
         let (focus, hover, pointer) = (*focus, *hover, *pointer);
         let w = win.as_mut().expect("window");
         let Win { gpu, fonts, atlas, scale, .. } = w;
         let scale = *scale;
-        let pad = (GRID_PAD * scale).round();
         let cursor = gpu.present(shot.as_deref(), |canvas, ctx| {
             render::background(canvas, &scene);
             let mut cursor = None;
@@ -804,10 +818,6 @@ impl App {
             _ => eprintln!("frith: unknown script action {action}"),
         }
     }
-}
-
-fn font_config() -> FontConfig {
-    FontConfig { family: "Menlo".into(), fallbacks: vec![] }
 }
 
 /// The tile or card frame of `pane`, if it is visible.

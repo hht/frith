@@ -20,6 +20,7 @@ use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use libghostty_vt::color::Rgb;
 use libghostty_vt::effect::{
     ClipboardMime, ConformanceLevel, DeviceAttributeFeature, DeviceAttributes, DeviceType, PrimaryDeviceAttributes,
     SecondaryDeviceAttributes,
@@ -33,6 +34,7 @@ use winit::event::{ElementState, KeyEvent};
 use winit::keyboard::{Key as WKey, KeyCode, ModifiersState, PhysicalKey};
 
 use crate::pty::{self, Program, Pty};
+use frith_core::config::Config;
 
 pub const TERM: &str = "xterm-256color";
 const NAME: &str = "frith";
@@ -74,17 +76,31 @@ pub struct GridSize {
     pub cell_w: u32,
     pub cell_h: u32,
     /// Padding around the grid inside the content area.
-    pub pad: u32,
+    pub pad: Pad,
     /// Size of the content area.
     pub width: u32,
     pub height: u32,
 }
 
+/// Space between each edge of the content area and the grid, in physical pixels.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct Pad {
+    pub left: u32,
+    pub top: u32,
+    pub right: u32,
+    pub bottom: u32,
+}
+
 impl GridSize {
-    /// The largest grid that fits `width`×`height` with `pad` on every side (at least 2×2).
-    pub fn fit(width: u32, height: u32, cell_w: u32, cell_h: u32, pad: u32) -> GridSize {
-        let cells = |len: u32, cell: u32| (len.saturating_sub(2 * pad) / cell).clamp(2, u16::MAX as u32) as u16;
-        GridSize { cols: cells(width, cell_w), rows: cells(height, cell_h), cell_w, cell_h, pad, width, height }
+    /// The largest grid that fits `width`×`height` inside `pad` (at least 2×2). Padding is
+    /// cut to the area, so sums of it never overflow here or in libghostty-vt.
+    pub fn fit(width: u32, height: u32, cell_w: u32, cell_h: u32, pad: Pad) -> GridSize {
+        let (left, top) = (pad.left.min(width), pad.top.min(height));
+        let (right, bottom) = (pad.right.min(width - left), pad.bottom.min(height - top));
+        let pad = Pad { left, top, right, bottom };
+        let cells = |len: u32, cell: u32| (len / cell).clamp(2, u16::MAX as u32) as u16;
+        let (cols, rows) = (cells(width - left - right, cell_w), cells(height - top - bottom, cell_h));
+        GridSize { cols, rows, cell_w, cell_h, pad, width, height }
     }
 }
 
@@ -137,6 +153,7 @@ impl Session {
         program: &Program,
         cwd: &Path,
         size: GridSize,
+        config: &Config,
         wake: impl Fn() + Send + 'static,
     ) -> std::io::Result<Session> {
         // Apps launched from Finder or launchd carry no LANG; without a UTF-8 LC_CTYPE, zsh's
@@ -195,7 +212,7 @@ impl Session {
             }
         });
         let shared = Rc::new(Shared::default());
-        let term = make_terminal(size, input.clone(), shared.clone());
+        let term = make_terminal(size, config, input.clone(), shared.clone());
         Ok(Session {
             term,
             shared,
@@ -352,10 +369,10 @@ impl Session {
             screen_height: s.height,
             cell_width: s.cell_w,
             cell_height: s.cell_h,
-            padding_top: s.pad,
-            padding_bottom: s.pad,
-            padding_left: s.pad,
-            padding_right: s.pad,
+            padding_top: s.pad.top,
+            padding_bottom: s.pad.bottom,
+            padding_left: s.pad.left,
+            padding_right: s.pad.right,
         });
         self.mouse_enc.set_any_button_pressed(any_pressed).set_track_last_cell(true);
         self.mouse_ev
@@ -425,9 +442,29 @@ fn pty_size(s: GridSize) -> pty::Size {
     pty::Size { cols: s.cols, rows: s.rows, width: px(s.width), height: px(s.height) }
 }
 
-fn make_terminal(size: GridSize, input: mpsc::Sender<Vec<u8>>, shared: Rc<Shared>) -> Terminal<'static, 'static> {
+fn make_terminal(
+    size: GridSize,
+    config: &Config,
+    input: mpsc::Sender<Vec<u8>>,
+    shared: Rc<Shared>,
+) -> Terminal<'static, 'static> {
     let mut t = Terminal::new(size.cols, size.rows).expect("terminal");
     t.set_scrollback_max_lines(Some(10_000)).unwrap().set_terminfo_name(TERM).unwrap();
+    // The configured colors become the terminal's defaults, which programs query (OSC 4,
+    // 10, 11, 12) and may override; unset ones keep libghostty-vt's.
+    let rgb = |c: frith_core::config::Rgb| Rgb { r: c.r, g: c.g, b: c.b };
+    let mut palette = t.default_color_palette().unwrap();
+    for (&i, &c) in &config.palette {
+        palette.0[usize::from(i)] = rgb(c);
+    }
+    t.set_default_fg_color(config.foreground.map(rgb))
+        .unwrap()
+        .set_default_bg_color(config.background.map(rgb))
+        .unwrap()
+        .set_default_cursor_color(config.cursor_color.map(rgb))
+        .unwrap()
+        .set_default_color_palette(Some(palette))
+        .unwrap();
     t.resize(size.cols, size.rows, size.cell_w, size.cell_h).unwrap();
     shared.grid.set((size.cols, size.rows, size.cell_w, size.cell_h));
 
@@ -606,8 +643,9 @@ mod tests {
     use super::*;
 
     fn run(line: &str) -> Session {
-        let size = GridSize::fit(800, 240, 10, 20, 0);
-        let mut s = Session::spawn(&Program::Command(line.into()), Path::new("/"), size, || {}).unwrap();
+        let size = GridSize::fit(800, 240, 10, 20, Pad::default());
+        let mut s =
+            Session::spawn(&Program::Command(line.into()), Path::new("/"), size, &Config::default(), || {}).unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
         while !s.feed(1 << 20).exited {
             assert!(Instant::now() < deadline, "child did not exit");
@@ -618,8 +656,11 @@ mod tests {
 
     /// Starts `line` and feeds its output until the screen shows `marker`.
     fn started(line: &str, marker: &str) -> Session {
-        let size = GridSize::fit(800, 240, 10, 20, 0);
-        let mut s = Session::spawn(&Program::Command(line.into()), Path::new("/"), size, || {}).unwrap();
+        started_with(line, marker, GridSize::fit(800, 240, 10, 20, Pad::default()), &Config::default())
+    }
+
+    fn started_with(line: &str, marker: &str, size: GridSize, config: &Config) -> Session {
+        let mut s = Session::spawn(&Program::Command(line.into()), Path::new("/"), size, config, || {}).unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
         while !s.screen_text().contains(marker) {
             assert!(Instant::now() < deadline, "no {marker:?}: {:?}", s.screen_text());
@@ -656,13 +697,14 @@ mod tests {
         use std::sync::atomic::{AtomicBool, Ordering};
         let woken = Arc::new(AtomicBool::new(false));
         let w = woken.clone();
-        let size = GridSize::fit(800, 240, 10, 20, 0);
+        let size = GridSize::fit(800, 240, 10, 20, Pad::default());
         // The child stays alive: its exit would wake the app and hide a stall.
         let line = "head -c 100000 /dev/zero | tr '\\0' a; printf done; sleep 30";
-        let mut s = Session::spawn(&Program::Command(line.into()), Path::new("/"), size, move || {
-            w.store(true, Ordering::Release);
-        })
-        .unwrap();
+        let mut s =
+            Session::spawn(&Program::Command(line.into()), Path::new("/"), size, &Config::default(), move || {
+                w.store(true, Ordering::Release);
+            })
+            .unwrap();
         let deadline = Instant::now() + Duration::from_secs(20);
         let mut more = false;
         loop {
@@ -677,6 +719,59 @@ mod tests {
                 thread::sleep(Duration::from_millis(1));
             }
         }
+    }
+
+    #[test]
+    fn the_configured_colors_are_what_the_terminal_reports() {
+        let mut c = Config::default();
+        c.read("background = #21252b\nforeground = #abb2bf\ncursor-color = #112233\npalette = 1=#e06c75\n");
+        // The replies come back on stdin; `cat` reads them until 0.5 s pass without input
+        // (`min 0 time 5`), then prints them with BEL as a line break.
+        let line = "stty raw -echo min 0 time 5; \
+                    printf '\\033]10;?\\a\\033]11;?\\a\\033]12;?\\a\\033]4;1;?\\a'; \
+                    r=$(cat); stty sane; \
+                    printf '%s' \"$r\" | tr '\\007' '\\n' | cat -v; echo end";
+        let s = started_with(line, "end", GridSize::fit(800, 240, 10, 20, Pad::default()), &c);
+        let text = s.screen_text();
+        for want in
+            ["]10;rgb:abab/b2b2/bfbf", "]11;rgb:2121/2525/2b2b", "]12;rgb:1111/2222/3333", "]4;1;rgb:e0e0/6c6c/7575"]
+        {
+            assert!(text.contains(want), "no {want:?} in {text:?}");
+        }
+    }
+
+    #[test]
+    fn padding_on_each_side_shrinks_the_grid_and_offsets_mouse_reports() {
+        let pad = Pad { left: 30, top: 12, right: 10, bottom: 8 };
+        let size = GridSize::fit(800, 240, 10, 20, pad);
+        assert_eq!((size.cols, size.rows), (76, 11), "(800 - 40) / 10, (240 - 20) / 20");
+        // SGR mouse reports; the child prints the first report it reads.
+        let line = "printf '\\033[?1000h\\033[?1006h'; stty raw -echo min 1; printf ready; \
+                    r=$(dd bs=64 count=1 2>/dev/null); stty sane; printf '%s' \"$r\" | cat -v; echo end";
+        let mut s = started_with(line, "ready", size, &Config::default());
+        // Inside the third column and the second row of the grid.
+        s.mouse(
+            mouse::Action::Press,
+            Some(mouse::Button::Left),
+            (30.0 + 25.0, 12.0 + 25.0),
+            ModifiersState::empty(),
+            true,
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !s.screen_text().contains("end") {
+            assert!(Instant::now() < deadline, "{:?}", s.screen_text());
+            s.feed(1 << 20);
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(s.screen_text().contains("^[[<0;3;2M"), "{:?}", s.screen_text());
+    }
+
+    #[test]
+    fn padding_larger_than_the_content_leaves_the_smallest_grid() {
+        let pad = Pad { left: u32::MAX, top: u32::MAX, right: u32::MAX, bottom: u32::MAX };
+        let size = GridSize::fit(800, 240, 10, 20, pad);
+        assert_eq!((size.cols, size.rows), (2, 2));
+        assert!(size.pad.left + size.pad.right <= 800 && size.pad.top + size.pad.bottom <= 240, "{:?}", size.pad);
     }
 
     #[test]
@@ -727,8 +822,11 @@ mod tests {
     #[test]
     fn resizes_within_25_ms_of_the_first_reach_the_terminal_and_child_as_one() {
         let mut s = started("trap 'printf \"<winch>\"' WINCH; printf ready; while :; do sleep 0.01; done", "ready");
-        let (before, wide, narrow) =
-            (s.term.cols().unwrap(), GridSize::fit(600, 240, 10, 20, 0), GridSize::fit(500, 240, 10, 20, 0));
+        let (before, wide, narrow) = (
+            s.term.cols().unwrap(),
+            GridSize::fit(600, 240, 10, 20, Pad::default()),
+            GridSize::fit(500, 240, 10, 20, Pad::default()),
+        );
         let t0 = Instant::now();
         let due = t0 + Duration::from_millis(25);
         assert_eq!(s.resize(wide, t0), Some(due), "waits for more");

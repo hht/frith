@@ -15,12 +15,15 @@
 
 mod app;
 mod atlas;
+mod config_files;
 mod fonts;
 mod gpu;
 mod grid;
 mod pty;
 mod render;
 mod term;
+
+use std::path::PathBuf;
 
 use winit::event_loop::EventLoop;
 
@@ -88,7 +91,13 @@ pub fn unescape(s: &str) -> Vec<u8> {
 }
 
 fn main() {
+    let home = PathBuf::from(env("HOME").unwrap_or_else(|| "/".into()));
+    let xdg = env("XDG_CONFIG_HOME").map(PathBuf::from);
+    let (config, msgs) = config_files::load(&home, xdg.as_deref());
+    for m in msgs {
+        eprintln!("frith: {m}");
+    }
     let event_loop = EventLoop::new().expect("event loop");
-    let app = app::App::new(Cfg::from_env(), event_loop.create_proxy());
+    let app = app::App::new(Cfg::from_env(), config, event_loop.create_proxy());
     event_loop.run_app(app).expect("event loop run");
 }

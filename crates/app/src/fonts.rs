@@ -3,9 +3,9 @@
 //! Answers: given a character, which typeface and glyph draw it?
 //! Must not know: terminals, layout, or how glyphs are rasterized and cached.
 //!
-//! Lookup order (ADR 5): the configured family, the configured fallbacks, the bundled
-//! Symbols Nerd Font, then the system's per-character fallback. LastResort is never used: it
-//! claims every code point with placeholder boxes, so once loaded it would shadow every later
+//! Lookup order (ADR 5): the configured families that are installed, the bundled Symbols
+//! Nerd Font, then the system's per-character fallback. LastResort is never used: it claims
+//! every code point with placeholder boxes, so once loaded it would shadow every later
 //! fallback (spike problem 9: braille showed as `?` after p10k icons were drawn).
 
 use std::collections::HashMap;
@@ -22,11 +22,8 @@ const LAST_RESORT: &str = ".LastResort";
 /// Languages hinted to the system fallback, so Han characters prefer Simplified Chinese forms.
 const FALLBACK_LANGS: [&str; 3] = ["zh-Hans", "ja", "ko"];
 
-#[derive(Clone, Debug, PartialEq)]
-pub struct FontConfig {
-    pub family: String,
-    pub fallbacks: Vec<String>,
-}
+/// Draws text when no configured family is installed (ADR 13).
+const DEFAULT_FAMILY: &str = "Menlo";
 
 /// One typeface of the lookup order, as indices into `Fonts::fonts`.
 struct Face {
@@ -61,24 +58,32 @@ pub struct Fonts {
 }
 
 impl Fonts {
+    /// `families` in lookup order; the first installed one sets the cell size, as in Ghostty.
     /// `size` is in physical pixels.
-    pub fn new(cfg: &FontConfig, size: f32) -> Fonts {
+    pub fn new(families: &[String], size: f32) -> Fonts {
         let mgr = FontMgr::new();
-        let primary = mgr.match_family_style(&cfg.family, FontStyle::normal()).unwrap_or_else(|| {
-            eprintln!("frith: font family {:?} is not installed; using Menlo", cfg.family);
-            mgr.match_family_style("Menlo", FontStyle::normal()).expect("Menlo ships with macOS")
-        });
-        let configured = cfg.fallbacks.iter().filter_map(|name| {
-            let tf = mgr.match_family_style(name, FontStyle::normal());
-            if tf.is_none() {
-                eprintln!("frith: fallback font {name:?} is not installed; skipping it");
-            }
-            tf
-        });
+        let mut typefaces: Vec<(Typeface, Option<Typeface>)> = families
+            .iter()
+            .filter_map(|name| {
+                let tf = mgr.match_family_style(name, FontStyle::normal());
+                if tf.is_none() {
+                    eprintln!("frith: font family {name:?} is not installed; skipping it");
+                }
+                tf.map(|tf| {
+                    let bold = system_bold(&mgr, &tf);
+                    (tf, bold)
+                })
+            })
+            .collect();
+        if typefaces.is_empty() {
+            let menlo = mgr.match_family_style(DEFAULT_FAMILY, FontStyle::normal()).expect("Menlo ships with macOS");
+            let bold = system_bold(&mgr, &menlo);
+            typefaces.push((menlo, bold));
+        }
         let nerd = mgr.new_from_data(Data::new_copy(NERD_SYMBOLS), None).expect("bundled Nerd Font parses");
-        let typefaces: Vec<Typeface> = std::iter::once(primary).chain(configured).chain([nerd]).collect();
+        typefaces.push((nerd, None));
         let mut fonts = Vec::new();
-        let faces = typefaces.into_iter().map(|tf| add_face(&mut fonts, &mgr, tf, size)).collect::<Vec<_>>();
+        let faces = typefaces.into_iter().map(|(tf, bold)| add_face(&mut fonts, tf, bold, size)).collect::<Vec<_>>();
         let font = &fonts[faces[0].regular];
         let (_, m) = font.metrics();
         let cell_h = (m.descent - m.ascent + m.leading).ceil();
@@ -110,7 +115,8 @@ impl Fonts {
         if tf.family_name() == LAST_RESORT || tf.unichar_to_glyph(c as i32) == 0 {
             return None;
         }
-        let face = add_face(&mut self.fonts, &self.mgr, tf, self.size);
+        let bold = system_bold(&self.mgr, &tf);
+        let face = add_face(&mut self.fonts, tf, bold, self.size);
         self.faces.push(face);
         Some(self.faces.len() - 1)
     }
@@ -126,11 +132,14 @@ impl Fonts {
     }
 }
 
-/// Adds `tf`'s regular, real bold (when the family has one) and synthetic bold fonts.
-fn add_face(fonts: &mut Vec<Font>, mgr: &FontMgr, tf: Typeface, size: f32) -> Face {
-    let bold_tf = mgr
-        .match_family_style(tf.family_name(), FontStyle::bold())
-        .filter(|b| b.font_style().weight() > tf.font_style().weight());
+/// The installed bold face of `tf`'s family, when it is heavier than `tf`.
+fn system_bold(mgr: &FontMgr, tf: &Typeface) -> Option<Typeface> {
+    mgr.match_family_style(tf.family_name(), FontStyle::bold())
+        .filter(|b| b.font_style().weight() > tf.font_style().weight())
+}
+
+/// Adds `tf`'s regular, real bold (when it has one) and synthetic bold fonts.
+fn add_face(fonts: &mut Vec<Font>, tf: Typeface, bold_tf: Option<Typeface>, size: f32) -> Face {
     let mut push = |f: Font| {
         fonts.push(f);
         fonts.len() - 1
@@ -154,7 +163,11 @@ mod tests {
     use super::*;
 
     fn fonts() -> Fonts {
-        Fonts::new(&FontConfig { family: "Menlo".into(), fallbacks: vec![] }, 26.0)
+        with(&["Menlo"])
+    }
+
+    fn with(families: &[&str]) -> Fonts {
+        Fonts::new(&families.iter().map(|f| f.to_string()).collect::<Vec<_>>(), 26.0)
     }
 
     fn family(f: &mut Fonts, c: char) -> Option<String> {
@@ -183,6 +196,23 @@ mod tests {
     #[test]
     fn ascii_comes_from_the_configured_family() {
         assert_eq!(family(&mut fonts(), 'a').as_deref(), Some("Menlo"));
+    }
+
+    #[test]
+    fn the_first_installed_family_draws_text_and_sets_the_cell() {
+        let mut f = with(&["No Such Font", "Monaco", "Menlo"]);
+        assert_eq!(family(&mut f, 'a').as_deref(), Some("Monaco"));
+        let (menlo, monaco) = (fonts(), with(&["Monaco"]));
+        assert_ne!(menlo.cell_h, monaco.cell_h, "the two families need different cells for this test");
+        assert_eq!((f.cell_w, f.cell_h), (monaco.cell_w, monaco.cell_h));
+    }
+
+    #[test]
+    fn without_an_installed_family_menlo_draws_text() {
+        for families in [&[][..], &["No Such Font"]] {
+            let mut f = with(families);
+            assert_eq!(family(&mut f, 'a').as_deref(), Some("Menlo"), "{families:?}");
+        }
     }
 
     #[test]

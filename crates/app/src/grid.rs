@@ -41,6 +41,8 @@ pub struct Grid {
     atlas_generation: u64,
     background: Color,
     cursor: Option<Rect>,
+    /// The terminal's cursor color (configured, or set by OSC 12), if it has one.
+    cursor_color: Option<Color>,
     // Reused every frame for the single draw_atlas call.
     xf: Vec<RSXform>,
     tex: Vec<Rect>,
@@ -52,10 +54,11 @@ pub struct Grid {
 pub struct Look {
     /// The content area, in window coordinates.
     pub content: skia_safe::Rect,
-    /// Padding between the content edge and the grid.
-    pub pad: f32,
+    /// Padding between the content's left and top edges and the grid.
+    pub pad: (f32, f32),
     /// An unfocused pane gets a hollow cursor.
     pub focused: bool,
+    /// The cursor color when the terminal has none.
     pub cursor: Color,
     /// False draws the cached rows unchanged: DEC 2026 synchronized output holds the frame.
     pub update: bool,
@@ -71,6 +74,7 @@ impl Grid {
             atlas_generation: 0,
             background: Color::BLACK,
             cursor: None,
+            cursor_color: None,
             xf: Vec::new(),
             tex: Vec::new(),
             col: Vec::new(),
@@ -141,7 +145,7 @@ impl Grid {
         }
         if let Some(r) = self.cursor {
             let mut cp = Paint::default();
-            cp.set_color(look.cursor).set_anti_alias(true);
+            cp.set_color(self.cursor_color.unwrap_or(look.cursor)).set_anti_alias(true);
             if look.focused {
                 cp.set_alpha(170);
             } else {
@@ -154,11 +158,12 @@ impl Grid {
     }
 
     /// Re-reads dirty rows from the terminal into the row caches.
-    fn rebuild(&mut self, fonts: &mut Fonts, atlas: &mut Atlas, term: &Terminal<'static, 'static>, pad: f32) {
+    fn rebuild(&mut self, fonts: &mut Fonts, atlas: &mut Atlas, term: &Terminal<'static, 'static>, pad: (f32, f32)) {
         let snap = self.rs.update(term).expect("render state update");
         let colors = snap.colors().expect("colors");
         let (dfg, dbg) = (colors.foreground, colors.background);
         self.background = color(dbg);
+        self.cursor_color = colors.cursor.map(color);
         let full = matches!(snap.dirty().expect("dirty"), Dirty::Full);
         let nrows = snap.rows().expect("rows") as usize;
         if self.rows.len() != nrows {
@@ -178,7 +183,7 @@ impl Grid {
                 continue;
             }
             let rc = slot.insert(Row::default());
-            let top = pad + y as f32 * ch;
+            let top = pad.1 + y as f32 * ch;
             let mut cells = self.cell_it.update(row).expect("cell iterator");
             let mut x = 0usize;
             while let Some(cell) = cells.next() {
@@ -189,7 +194,7 @@ impl Grid {
                     continue;
                 }
                 let span = if matches!(wide, CellWide::Wide) { 2.0 } else { 1.0 };
-                let left = pad + x as f32 * cw;
+                let left = pad.0 + x as f32 * cw;
                 let mut fg = cell.fg_color().expect("fg").unwrap_or(dfg);
                 let mut bg = cell.bg_color().expect("bg");
                 let (mut bold, mut ul, mut strike, mut invisible) = (false, false, false, false);
@@ -239,7 +244,7 @@ impl Grid {
         if snap.cursor_visible().unwrap_or(false)
             && let Ok(Some(vp)) = snap.cursor_viewport()
         {
-            self.cursor = Some(Rect::from_xywh(pad + vp.x as f32 * cw, pad + vp.y as f32 * ch, cw, ch));
+            self.cursor = Some(Rect::from_xywh(pad.0 + vp.x as f32 * cw, pad.1 + vp.y as f32 * ch, cw, ch));
         }
         let _ = snap.clean();
     }
