@@ -21,6 +21,7 @@ mod gpu;
 mod grid;
 mod pty;
 mod render;
+mod sprite;
 mod term;
 
 use std::path::PathBuf;

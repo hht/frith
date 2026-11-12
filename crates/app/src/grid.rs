@@ -14,8 +14,9 @@ use libghostty_vt::style::Underline;
 use libghostty_vt::terminal::Terminal;
 use skia_safe::{BlendMode, Canvas, ClipOp, Color, Paint, PaintStyle, RSXform, Rect, SamplingOptions, gpu};
 
-use crate::atlas::{self, Atlas};
+use crate::atlas::{self, Atlas, Key};
 use crate::fonts::Fonts;
+use crate::sprite;
 
 fn color(rgb: Rgb) -> Color {
     Color::from_rgb(rgb.r, rgb.g, rgb.b)
@@ -227,10 +228,12 @@ impl Grid {
                     rc.lines.push((Rect::from_xywh(left, top + ch * 0.5, cw * span, 1.5), color(fg)));
                 }
                 let cp = raw.codepoint().expect("codepoint");
-                if let Some(g) =
-                    char::from_u32(cp).filter(|_| !invisible && cp > 32).and_then(|c| fonts.lookup(c, bold))
-                {
-                    let slot = atlas.get(fonts, g);
+                // Sprites win over every font, as in Ghostty, so lines meet across cells.
+                let key = char::from_u32(cp).filter(|_| !invisible && cp > 32).and_then(|c| {
+                    if sprite::covers(c) { Some(Key::Sprite(c)) } else { fonts.lookup(c, bold).map(Key::Glyph) }
+                });
+                if let Some(key) = key {
+                    let slot = atlas.get(fonts, key);
                     rc.xf.push(RSXform::new(1.0, 0.0, (left - atlas::PAD, top - atlas::PAD)));
                     rc.tex.push(slot);
                     rc.col.push(color(fg));

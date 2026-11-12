@@ -63,6 +63,8 @@ pub struct Fonts {
     pub ascent: f32,
     /// Horizontal offset of every glyph from the cell's left edge.
     pub glyph_x: f32,
+    /// Width of a light box-drawing line in whole pixels.
+    pub box_thickness: u32,
 }
 
 impl Fonts {
@@ -92,8 +94,10 @@ impl Fonts {
         typefaces.push((nerd, None));
         let mut fonts = Vec::new();
         let faces = typefaces.into_iter().map(|(tf, bold)| add_face(&mut fonts, tf, bold, size)).collect::<Vec<_>>();
-        let Cell { w: cell_w, h: cell_h, ascent, glyph_x } = cell_metrics(&fonts[faces[0].regular]);
-        Fonts { mgr, size, fonts, faces, map: HashMap::new(), cell_w, cell_h, ascent, glyph_x }
+        let primary = &fonts[faces[0].regular];
+        let Cell { w: cell_w, h: cell_h, ascent, glyph_x } = cell_metrics(primary);
+        let box_thickness = underline_thickness(primary).ceil().max(1.0) as u32;
+        Fonts { mgr, size, fonts, faces, map: HashMap::new(), cell_w, cell_h, ascent, glyph_x, box_thickness }
     }
 
     /// The glyph that draws `c` in regular or bold, or `None` when no usable font has it.
@@ -201,6 +205,24 @@ fn table_metrics(tf: &Typeface, size: f64) -> Option<(f64, f64, f64)> {
     }
 }
 
+/// The underline thickness in pixels, from the font's `post` table; when the table is
+/// missing or gives 0, 15% of the x-height, as Ghostty estimates it. Ghostty draws box
+/// lines this thick, rounded up to whole pixels and at least 1.
+/// @see https://learn.microsoft.com/en-us/typography/opentype/spec/post (underlineThickness at offset 10)
+/// @see Ghostty `src/font/face/coretext.zig` (`getMetrics`), `src/font/Metrics.zig` (`underlineThickness`, `calc`)
+fn underline_thickness(font: &Font) -> f32 {
+    let tf = font.typeface();
+    let units = tf.units_per_em().filter(|&u| u > 0);
+    let post = tf.copy_table_data(u32::from_be_bytes(*b"post"));
+    let from_post = post.as_deref().and_then(|d| d.get(10..12)).map(|b| i16::from_be_bytes([b[0], b[1]]));
+    match (from_post, units) {
+        (Some(t), Some(u)) if t > 0 => (f64::from(t) * f64::from(font.size()) / f64::from(u)) as f32,
+        // Ghostty prefers the OS/2 sxHeight here; Skia's x-height comes from the platform
+        // (CoreText on macOS), which may differ. Only fonts without a usable post table get here.
+        _ => 0.15 * font.metrics().1.x_height,
+    }
+}
+
 /// The installed bold face of `tf`'s family, when it is heavier than `tf`.
 fn system_bold(mgr: &FontMgr, tf: &Typeface) -> Option<Typeface> {
     mgr.match_family_style(tf.family_name(), FontStyle::bold())
@@ -276,6 +298,17 @@ mod tests {
         assert_eq!((f.cell_w, f.cell_h, f.ascent), (14.0, 32.0, 25.0));
         // JetBrains Mono advances 600 of 1000 units, 14.4 px: centered in 14 px, 0.2 px left.
         assert!((f.glyph_x + 0.2).abs() < 1e-4, "{}", f.glyph_x);
+    }
+
+    #[test]
+    fn box_lines_are_as_thick_as_the_underline_rounded_up() {
+        // JetBrains Mono's post table: underlineThickness 50 of 1000 units, 1.2 px at 24 px.
+        assert_eq!(Fonts::new(&[], 24.0).box_thickness, 2);
+        // The table gives 1.5 px, rounded up to 2; the x-height estimate (sxHeight 550) would
+        // give 2.475 px, rounded up to 3.
+        assert_eq!(Fonts::new(&[], 30.0).box_thickness, 2);
+        assert_eq!(Fonts::new(&[], 12.0).box_thickness, 1);
+        assert_eq!(Fonts::new(&[], 0.1).box_thickness, 1, "at least 1 px");
     }
 
     #[test]
