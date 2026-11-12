@@ -72,6 +72,7 @@
 
 决定：按 OSC 133 公开规范自行编写极简 shell 集成，只发提示符标记（`133;A;redraw=1`、`B`、`C`、`D`），让终端在 resize 时清掉旧提示符、由 shell 重绘。先做 zsh（macOS 默认 shell），bash、fish 随后。注入方式参照 Ghostty（MIT）的 `src/termio/shell_integration.zig`：zsh 用 `ZDOTDIR` 指向集成目录，先恢复用户原有 `ZDOTDIR` 并加载其 `.zshenv`。不复制 Ghostty 或 Kitty 的集成脚本。
 理由：libghostty-vt 的 C API 默认不清除提示符（`c/terminal.zig:1056`，`shell_redraws_prompt = .false`），且无选项可改，只能由 shell 以 `redraw=1` 开启；没有标记时窗口 resize 会堆叠提示符。只合并 resize（已实现，25 ms）只能减少次数。Ghostty 的 zsh、bash 集成脚本为 GPLv3（源自 Kitty），直接内置会约束产品授权；自写只含所需部分。
+脚本落盘（2026-11-12 补充）：脚本以 `include_str!` 编进二进制（约 2 KB），启动时写到用户缓存目录下以内容哈希命名的子目录（macOS 为 `~/Library/Caches/frith/shell-integration/<哈希>/`），已存在则跳过；先写临时目录再改名，多个实例同时启动也不会读到写了一半的脚本；写不进时跳过集成并提示。理由：Frith 目前是裸二进制，没有 Ghostty 那样的 app bundle 资源目录；有了 bundle 后可改为随包分发。
 
 ## 12. 不内置统一的 shell 主题，修渲染（2026-11-12）
 
@@ -82,3 +83,15 @@
 
 决定：Frith 读取自己的配置文件，语法与键名沿用 Ghostty（`key = value`，`#` 开头为注释，值可加双引号，空值恢复默认，`font-family`、`palette` 可重复）。Frith 的配置文件不存在时，按 Ghostty 的顺序读取用户的 Ghostty 配置（先 `$XDG_CONFIG_HOME/ghostty/`，再 macOS 的 `~/Library/Application Support/com.mitchellh.ghostty/`）。不认识的键忽略并提示。`theme` 暂不支持。配置的字体未安装时按 ADR 5 退回内置的 JetBrains Mono，与 Ghostty 一致。第一步支持字体、字号、前景与背景色、光标色、调色板、内边距；背景透明、模糊、`font-thicken` 另行调研。
 理由：用户截图对比显示，Frith 与其 Ghostty 的差异全部来自配置（背景、字体、字号、调色板、内边距），而 256 色色块的显示值完全一致。读取已有 Ghostty 配置可让用户开箱即得同样外观，兑现 ADR 3「沿用 Ghostty 的配置格式与主题」。
+
+## 14. 外框视觉语言：取自终端、系统字体、淡化未聚焦面板（2026-11-12）
+
+决定：
+- 推进顺序：先保证内容显示正确（ADR 11 shell 集成、ADR 12 自绘字形），再统一外框外观，然后做动效（ADR 10）、毛玻璃、侧栏（ADR 9）。
+- 外框配色取自终端背景：顶栏、面板标题行、底栏、卡片按终端背景色的亮度推导出几档相近的色阶，不再使用独立的固定配色；强调色取调色板 4 号色；外框文字与其底色的对比度不低于 4.5:1（WCAG 1.4.3），极亮或极暗的主题也要满足。
+- 外框文字（标题栏、面板标题、标签、提示）用系统 UI 字体（macOS 为 SF，Windows 为 Segoe UI），经 Skia FontMgr 取用，不内置字体；终端网格仍用 ADR 5 的字体。
+- 未聚焦的面板淡化：按 Ghostty 的做法在其上叠一层半透明矩形，读取 `unfocused-split-opacity`（默认 0.7，限制在 0.15–1）与 `unfocused-split-fill`（默认终端背景色）。
+- 底栏只在有最小化卡片时出现。
+- 面板标题只显示在面板标题行，顶栏不再重复显示焦点面板的标题。
+- 外框按钮的点击区不小于 24×24 逻辑像素（WCAG 2.5.8）。
+理由：用户要求把 UI/UX 推进到一流水平。终端内容占窗口绝大部分像素，内容显示不对时外框的打磨没有意义，配色也要以正确的内容为准来校准。外框与终端背景同色是 Ghostty 默认 `macos-titlebar-style = transparent` 的做法（`src/config/Config.zig`），换主题后外框自动协调。系统 UI 字体体积为零，与原生应用一致；内置 Inter 会增加约 0.3–0.8 MB（未实测），违背「小体积」。并排运行多个 agent 时焦点位置是最关键的信息，淡化未聚焦面板是 Ghostty 的默认行为（`unfocused-split-opacity` 默认 0.7）。
