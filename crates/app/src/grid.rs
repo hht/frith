@@ -30,19 +30,14 @@ struct Row {
     col: Vec<Color>,
 }
 
-impl Row {
-    fn is_empty(&self) -> bool {
-        self.bgs.is_empty() && self.lines.is_empty() && self.xf.is_empty()
-    }
-}
-
 /// Retained draw data for one pane's grid, relative to the content origin, so a pane that
 /// moves keeps it. `invalidate` after the fonts or atlas are replaced.
 pub struct Grid {
     rs: RenderState<'static>,
     row_it: RowIterator<'static>,
     cell_it: CellIterator<'static>,
-    rows: Vec<Row>,
+    /// `None` until the row is read; a blank row reads as `Some` of an empty `Row`.
+    rows: Vec<Option<Row>>,
     atlas_generation: u64,
     background: Color,
     cursor: Option<Rect>,
@@ -121,14 +116,14 @@ impl Grid {
         let mut p = Paint::default();
         p.set_color(self.background);
         canvas.draw_rect(Rect::from_wh(content.width(), content.height()), &p);
-        for (r, c) in self.rows.iter().flat_map(|row| &row.bgs) {
+        for (r, c) in self.rows.iter().flatten().flat_map(|row| &row.bgs) {
             p.set_color(*c);
             canvas.draw_rect(*r, &p);
         }
         self.xf.clear();
         self.tex.clear();
         self.col.clear();
-        for row in &self.rows {
+        for row in self.rows.iter().flatten() {
             self.xf.extend_from_slice(&row.xf);
             self.tex.extend_from_slice(&row.tex);
             self.col.extend_from_slice(&row.col);
@@ -140,7 +135,7 @@ impl Grid {
             let sampling = SamplingOptions::default();
             canvas.draw_atlas(&img, &self.xf, &self.tex, &self.col[..], BlendMode::Modulate, sampling, None, &tp);
         }
-        for (r, c) in self.rows.iter().flat_map(|row| &row.lines) {
+        for (r, c) in self.rows.iter().flatten().flat_map(|row| &row.lines) {
             p.set_color(*c);
             canvas.draw_rect(*r, &p);
         }
@@ -168,7 +163,7 @@ impl Grid {
         let nrows = snap.rows().expect("rows") as usize;
         if self.rows.len() != nrows {
             self.rows.clear();
-            self.rows.resize_with(nrows, Row::default);
+            self.rows.resize_with(nrows, || None);
         }
         let (cw, ch, asc) = (fonts.cell_w, fonts.cell_h, fonts.ascent);
         let mut row_it = self.row_it.update(&snap).expect("row iterator");
@@ -177,12 +172,12 @@ impl Grid {
             if y >= nrows {
                 break;
             }
-            let rc = &mut self.rows[y];
-            if !(full || rc.is_empty() || row.dirty().expect("row dirty")) {
+            let slot = &mut self.rows[y];
+            if !(full || slot.is_none() || row.dirty().expect("row dirty")) {
                 y += 1;
                 continue;
             }
-            *rc = Row::default();
+            let rc = slot.insert(Row::default());
             let top = pad + y as f32 * ch;
             let mut cells = self.cell_it.update(row).expect("cell iterator");
             let mut x = 0usize;
