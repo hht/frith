@@ -16,8 +16,15 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use std::{ptr, thread};
+
+/// Held from `openpty` until both fds are close-on-exec, and across `fork`, so no child
+/// spawned on another thread inherits a PTY fd in between. macOS has no atomic close-on-exec
+/// for PTYs: `posix_openpt` accepts only `O_RDWR` and `O_NOCTTY` (posix_openpt(2)). Any other
+/// code that spawns processes must hold it too.
+static SPAWN: Mutex<()> = Mutex::new(());
 
 /// What to run.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -48,6 +55,7 @@ impl Pty {
     /// Starts `program` on a new PTY of `size` in `cwd`, with `env` added to this process's
     /// environment.
     pub fn spawn(program: &Program, size: Size, cwd: &Path, env: &[(&str, &str)]) -> io::Result<Pty> {
+        let _spawning = SPAWN.lock().unwrap_or_else(|e| e.into_inner());
         let (mut master, mut slave) = (-1, -1);
         let mut ws = winsize(size);
         // SAFETY: openpty writes two fds into the out-pointers and reads `ws`.
@@ -115,9 +123,11 @@ impl Pty {
 
 impl Drop for Pty {
     /// Hangs up the child's whole process group, as closing a terminal window does, and
-    /// reaps the child off the main thread. A group still alive after `HANGUP_GRACE` gets
-    /// SIGKILL: a hangup that lands while a shell is between fork and exec can be lost
-    /// (seen with zsh), and some programs ignore SIGHUP.
+    /// reaps the child off the main thread. Only the child (the group leader) is waited for:
+    /// if it is still alive after `HANGUP_GRACE`, the group gets SIGKILL, since a hangup that
+    /// lands while a shell is between fork and exec can be lost (seen with zsh), and some
+    /// programs ignore SIGHUP. Once the leader is gone, members that ignore SIGHUP live on,
+    /// as `nohup` intends.
     fn drop(&mut self) {
         let Some(mut child) = self.child.take() else { return };
         // The child called setsid, so its pid is its process group id.

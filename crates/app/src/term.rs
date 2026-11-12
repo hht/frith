@@ -5,15 +5,18 @@
 //! Must not know: where the session is on screen (callers pass grid sizes and positions
 //! local to the terminal content) or how it is drawn.
 //!
-//! The IO thread only forwards bytes; the `Terminal` is `!Send` and stays on the main thread.
+//! Two IO threads only move bytes. A reader collects output in a buffer capped at
+//! `OUTPUT_CAP` bytes, so a child that floods output blocks on its PTY until the main thread
+//! catches up. A writer drains an input queue, so a child that reads no input never blocks
+//! the main thread. The input queue is unbounded, like Ghostty's write queue: it holds only
+//! what the user typed or pasted. The `Terminal` is `!Send` and stays on the main thread.
+//! @see https://github.com/ghostty-org/ghostty/blob/108cacb17ed8990840cd14abfce43d8ed8503ca1/src/termio/Exec.zig (`queueWrite`)
 
 use std::cell::Cell;
-use std::fs::File;
-use std::io::{Read, Write};
+use std::io::{ErrorKind, Read, Write};
 use std::path::Path;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::thread;
 
 use libghostty_vt::effect::{
@@ -31,6 +34,28 @@ use crate::pty::{self, Program, Pty};
 
 pub const TERM: &str = "xterm-256color";
 const NAME: &str = "frith";
+
+/// Bytes of output the reader may hold for `feed`, enough for several frames of a fast stream;
+/// with the backlog `feed` already took, up to twice this waits unparsed. Counted in bytes,
+/// not reads: a macOS PTY read returns at most 1024 bytes (measured).
+const OUTPUT_CAP: usize = 1 << 20;
+
+/// Output the reader thread has read and `feed` has not taken yet.
+#[derive(Default)]
+struct Output {
+    pending: Mutex<Pending>,
+    /// Signaled when `feed` takes the pending bytes or the session closes.
+    room: Condvar,
+}
+
+#[derive(Default)]
+struct Pending {
+    bytes: Vec<u8>,
+    /// The child side is gone; `bytes` holds the last of its output.
+    eof: bool,
+    /// The session is gone; the reader stops.
+    closed: bool,
+}
 
 /// Grid geometry of a session's content area, in physical pixels.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -67,7 +92,7 @@ pub struct Shared {
 /// Result of feeding pending PTY output into the terminal.
 pub struct Fed {
     pub bytes: usize,
-    /// The budget ran out; more output may be waiting.
+    /// Output is waiting (the budget ran out, or more arrived meanwhile); feed again.
     pub more: bool,
     /// The child has exited and all its output has been consumed.
     pub exited: bool,
@@ -76,10 +101,14 @@ pub struct Fed {
 pub struct Session {
     pub term: Terminal<'static, 'static>,
     pub shared: Rc<Shared>,
-    writer: Arc<Mutex<File>>,
+    input: mpsc::Sender<Vec<u8>>,
     pty: Pty,
-    rx: mpsc::Receiver<Vec<u8>>,
-    eof: Arc<AtomicBool>,
+    output: Arc<Output>,
+    /// Output taken from `output`, parsed up to `parsed`.
+    backlog: Vec<u8>,
+    parsed: usize,
+    /// `backlog` holds the child's last output.
+    eof: bool,
     size: GridSize,
     key_enc: key::Encoder<'static>,
     key_ev: key::Event<'static>,
@@ -98,50 +127,72 @@ impl Session {
         size: GridSize,
         wake: impl Fn() + Send + 'static,
     ) -> std::io::Result<Session> {
-        // Apps launched outside a shell (Finder, launchd) carry no locale; without a UTF-8
-        // LC_CTYPE, zsh's line editor shows typed CJK as <00ad>-style escapes.
-        let utf8 = ["LC_ALL", "LC_CTYPE", "LANG"]
-            .iter()
-            .find_map(|k| std::env::var(k).ok().filter(|v| !v.is_empty()))
-            .is_some_and(|v| v.to_ascii_uppercase().replace('-', "").contains("UTF8"));
+        // Apps launched from Finder or launchd carry no LANG; without a UTF-8 LC_CTYPE, zsh's
+        // line editor shows typed CJK as <00ad>-style escapes. Like Ghostty, set LANG only when
+        // it is unset or empty: locale variables the user did set (LC_ALL and LC_CTYPE
+        // included) are the user's choice. Unlike Ghostty, which derives LANG from the macOS
+        // language settings and also replaces an invalid LANG, this sets a fixed en_US.UTF-8.
+        // @see https://github.com/ghostty-org/ghostty/blob/108cacb17ed8990840cd14abfce43d8ed8503ca1/src/os/locale.zig
         let mut env = vec![("TERM", TERM), ("COLORTERM", "truecolor"), ("TERM_PROGRAM", NAME)];
-        if !utf8 {
+        if std::env::var_os("LANG").is_none_or(|v| v.is_empty()) {
             env.push(("LANG", "en_US.UTF-8"));
         }
         let pty = Pty::spawn(program, pty_size(size), cwd, &env)?;
         let mut reader = pty.reader()?;
-        let writer = Arc::new(Mutex::new(pty.writer()?));
-        let (tx, rx) = mpsc::channel();
-        let eof = Arc::new(AtomicBool::new(false));
-        let eof_io = eof.clone();
+        let mut writer = pty.writer()?;
+        let (input, queued) = mpsc::channel::<Vec<u8>>();
+        thread::spawn(move || {
+            // Ends when the session drops the sender, or when the child side is gone.
+            for data in queued {
+                if writer.write_all(&data).is_err() {
+                    break;
+                }
+            }
+        });
+        let output = Arc::new(Output::default());
+        let out = output.clone();
         thread::spawn(move || {
             let mut buf = vec![0u8; 64 * 1024];
             loop {
-                match reader.read(&mut buf) {
+                let n = match reader.read(&mut buf) {
+                    // A signal handler ran; not the end of output.
+                    // @see https://github.com/alacritty/alacritty/blob/v0.15.1/alacritty_terminal/src/event_loop.rs#L127
+                    Err(e) if e.kind() == ErrorKind::Interrupted => continue,
                     // EIO once the child side is gone (macOS), or EOF.
-                    Ok(0) | Err(_) => {
-                        eof_io.store(true, Ordering::Release);
-                        wake();
-                        break;
-                    }
-                    Ok(n) => {
-                        if tx.send(buf[..n].to_vec()).is_err() {
-                            break; // session dropped
-                        }
-                        wake();
-                    }
+                    Ok(0) | Err(_) => 0,
+                    Ok(n) => n,
+                };
+                let mut p = out.pending.lock().unwrap();
+                while n > 0 && p.bytes.len() >= OUTPUT_CAP && !p.closed {
+                    p = out.room.wait(p).unwrap();
+                }
+                if p.closed {
+                    break;
+                }
+                // The main thread was already woken for output it has not taken yet.
+                let idle = p.bytes.is_empty();
+                p.bytes.extend_from_slice(&buf[..n]);
+                p.eof = n == 0;
+                drop(p);
+                if idle || n == 0 {
+                    wake();
+                }
+                if n == 0 {
+                    break;
                 }
             }
         });
         let shared = Rc::new(Shared::default());
-        let term = make_terminal(size, writer.clone(), shared.clone());
+        let term = make_terminal(size, input.clone(), shared.clone());
         Ok(Session {
             term,
             shared,
             pty,
-            writer,
-            rx,
-            eof,
+            input,
+            output,
+            backlog: Vec::new(),
+            parsed: 0,
+            eof: false,
             size,
             key_enc: key::Encoder::new().expect("key encoder"),
             key_ev: key::Event::new().expect("key event"),
@@ -152,23 +203,36 @@ impl Session {
         })
     }
 
-    /// Parses pending output, at most about `budget` bytes, so other sessions and input
-    /// get their turn.
+    /// Parses pending output, at most `budget` bytes, so other sessions and input get their
+    /// turn. After `more: false` the next output calls `wake` again.
     pub fn feed(&mut self, budget: usize) -> Fed {
-        // Read EOF before draining: the IO thread sets it after its last send, so EOF seen
-        // here plus an empty channel afterwards means every byte has been parsed.
-        let eof = self.eof.load(Ordering::Acquire);
-        let mut bytes = 0;
-        while bytes < budget {
-            match self.rx.try_recv() {
-                Ok(chunk) => {
-                    bytes += chunk.len();
-                    self.term.vt_write(&chunk);
-                }
-                Err(_) => return Fed { bytes, more: false, exited: eof },
-            }
+        self.take_output();
+        let end = (self.parsed + budget).min(self.backlog.len());
+        let bytes = end - self.parsed;
+        self.term.vt_write(&self.backlog[self.parsed..end]);
+        self.parsed = end;
+        // Take what arrived meanwhile. The reader wakes the main thread only when it finds
+        // `pending` empty, and a wake that came during a `more` chain may already be used up,
+        // so `more: false` must mean `pending` was seen empty.
+        self.take_output();
+        let done = self.parsed == self.backlog.len();
+        Fed { bytes, more: !done, exited: done && self.eof }
+    }
+
+    /// Takes the reader's pending output once the backlog is all parsed.
+    fn take_output(&mut self) {
+        if self.parsed < self.backlog.len() {
+            return;
         }
-        Fed { bytes, more: true, exited: false }
+        self.backlog.clear();
+        self.parsed = 0;
+        let mut p = self.output.pending.lock().unwrap();
+        // The reader keeps the emptied backlog's allocation for its next bytes.
+        std::mem::swap(&mut self.backlog, &mut p.bytes);
+        // Taken under the same lock: once eof is set, the reader adds nothing more.
+        self.eof = p.eof;
+        drop(p);
+        self.output.room.notify_one();
     }
 
     /// Resizes terminal and PTY. Returns false when nothing changed.
@@ -184,8 +248,9 @@ impl Session {
         true
     }
 
+    /// Queues `data` for the child; never blocks. Input to a child that is gone is dropped.
     pub fn write(&self, data: &[u8]) {
-        let _ = self.writer.lock().unwrap().write_all(data);
+        let _ = self.input.send(data.to_vec());
     }
 
     pub fn title(&self) -> String {
@@ -222,7 +287,7 @@ impl Session {
         self.buf.clear();
         let encoded = self.key_enc.set_options_from_terminal(&self.term).encode_to_vec(&self.key_ev, &mut self.buf);
         if encoded.is_ok() && !self.buf.is_empty() {
-            let _ = self.writer.lock().unwrap().write_all(&self.buf);
+            self.write(&self.buf);
             self.term.scroll_viewport(ScrollViewport::Bottom);
         }
     }
@@ -263,7 +328,7 @@ impl Session {
             .set_button(button);
         self.buf.clear();
         if self.mouse_enc.encode_to_vec(&self.mouse_ev, &mut self.buf).is_ok() && !self.buf.is_empty() {
-            let _ = self.writer.lock().unwrap().write_all(&self.buf);
+            self.write(&self.buf);
         }
     }
 
@@ -295,6 +360,17 @@ impl Session {
     }
 }
 
+impl Drop for Session {
+    /// Releases a reader waiting for room. A reader blocked in `read`, and a writer blocked
+    /// mid-write, end once every process holding the child side has closed it; dropping the
+    /// `Pty` hangs up the child's group, but a descendant outside it (a disowned job) keeps
+    /// both threads blocked until it exits or writes.
+    fn drop(&mut self) {
+        self.output.pending.lock().unwrap().closed = true;
+        self.output.room.notify_one();
+    }
+}
+
 /// Plain text of the visible screen, for tests.
 #[cfg(test)]
 impl Session {
@@ -306,10 +382,13 @@ impl Session {
 }
 
 fn pty_size(s: GridSize) -> pty::Size {
-    pty::Size { cols: s.cols, rows: s.rows, width: s.width as u16, height: s.height as u16 }
+    // A content area lies inside one Metal drawable, a texture of at most 16384 px a side.
+    // @see https://developer.apple.com/metal/Metal-Feature-Set-Tables.pdf ("Maximum 2D texture width and height")
+    let px = |n: u32| u16::try_from(n).expect("content area fits a u16 pixel size");
+    pty::Size { cols: s.cols, rows: s.rows, width: px(s.width), height: px(s.height) }
 }
 
-fn make_terminal(size: GridSize, writer: Arc<Mutex<File>>, shared: Rc<Shared>) -> Terminal<'static, 'static> {
+fn make_terminal(size: GridSize, input: mpsc::Sender<Vec<u8>>, shared: Rc<Shared>) -> Terminal<'static, 'static> {
     let mut t = Terminal::new(size.cols, size.rows).expect("terminal");
     t.set_scrollback_max_lines(Some(10_000)).unwrap().set_terminfo_name(TERM).unwrap();
     t.resize(size.cols, size.rows, size.cell_w, size.cell_h).unwrap();
@@ -317,7 +396,7 @@ fn make_terminal(size: GridSize, writer: Arc<Mutex<File>>, shared: Rc<Shared>) -
 
     let s = shared.clone();
     t.on_pty_write(move |_t, data| {
-        let _ = writer.lock().unwrap().write_all(data);
+        let _ = input.send(data.to_vec());
     })
     .unwrap()
     .on_size(move |_t| {
@@ -500,6 +579,82 @@ mod tests {
         s
     }
 
+    /// Starts `line` and feeds its output until the screen shows `marker`.
+    fn started(line: &str, marker: &str) -> Session {
+        let size = GridSize::fit(800, 240, 10, 20, 0);
+        let mut s = Session::spawn(&Program::Command(line.into()), Path::new("/"), size, || {}).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !s.screen_text().contains(marker) {
+            assert!(Instant::now() < deadline, "no {marker:?}: {:?}", s.screen_text());
+            s.feed(1 << 20);
+            thread::sleep(Duration::from_millis(5));
+        }
+        s
+    }
+
+    #[test]
+    fn a_large_paste_into_a_program_that_reads_no_input_does_not_block_the_caller() {
+        let s = started("stty raw -echo; printf ready; sleep 3", "ready");
+        let start = Instant::now();
+        s.write(&vec![b'a'; 1 << 20]);
+        assert!(start.elapsed() < Duration::from_millis(500), "write blocked for {:?}", start.elapsed());
+    }
+
+    #[test]
+    #[cfg_attr(debug_assertions, ignore = "a debug libghostty-vt parses about 0.12 MB/s; run with --release")]
+    fn output_keeps_flowing_while_the_main_thread_renders() {
+        // 10 MB with 8 ms of rendering before each feed. Measured in release on an M-series Mac:
+        // 1.7 MB/s (about 5.8 s) when 16 reads of 1024 bytes could wait between frames;
+        // 0.6-0.7 s with `OUTPUT_CAP` at 1 MiB.
+        let mut s = started("printf ready; sleep 0.3; head -c 10000000 /dev/zero | tr '\\0' a", "ready");
+        let start = Instant::now();
+        while !s.feed(1 << 20).exited {
+            assert!(start.elapsed() < Duration::from_millis(2500), "output throttled by the reader buffer");
+            thread::sleep(Duration::from_millis(8));
+        }
+    }
+
+    #[test]
+    fn an_app_that_feeds_only_on_wake_or_more_sees_all_output_and_the_exit() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let woken = Arc::new(AtomicBool::new(false));
+        let w = woken.clone();
+        let size = GridSize::fit(800, 240, 10, 20, 0);
+        // The child stays alive: its exit would wake the app and hide a stall.
+        let line = "head -c 100000 /dev/zero | tr '\\0' a; printf done; sleep 30";
+        let mut s = Session::spawn(&Program::Command(line.into()), Path::new("/"), size, move || {
+            w.store(true, Ordering::Release);
+        })
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let mut more = false;
+        loop {
+            // A wake that arrives mid-chain is handled (and so used up) like any other.
+            let wake = woken.swap(false, Ordering::AcqRel);
+            if more || wake {
+                more = s.feed(1024).more; // small budget: long `more` chains, as with many busy panes
+            } else if s.screen_text().contains("done") {
+                break;
+            } else {
+                assert!(Instant::now() < deadline, "stalled without a wake: {:?}", s.screen_text());
+                thread::sleep(Duration::from_millis(1));
+            }
+        }
+    }
+
+    #[test]
+    fn input_reaches_the_child_in_order() {
+        let mut s = started("stty -echo; printf ready; read a; read b; printf '<%s|%s>' \"$a\" \"$b\"", "ready");
+        s.write(b"one\r");
+        s.write(b"two\r");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !s.screen_text().contains("<one|two>") {
+            assert!(Instant::now() < deadline, "{:?}", s.screen_text());
+            s.feed(1 << 20);
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
     #[test]
     fn output_is_parsed_into_the_screen_including_styles_and_wide_characters() {
         let s = run(r"printf 'hello \033[1;31m世界\033[0m!'");
@@ -508,9 +663,9 @@ mod tests {
 
     #[test]
     fn the_child_sees_the_terminal_type_and_a_utf8_locale() {
-        let s = run(r#"printf '%s %s' "$TERM" "$TERM_PROGRAM"; locale | grep -c UTF-8"#);
+        // Assumes the test runs with LANG unset, empty or UTF-8; a LANG=C is respected.
+        let s = run(r#"printf '%s %s %s' "$TERM" "$TERM_PROGRAM" "$(locale charmap)""#);
         let text = s.screen_text();
-        assert!(text.contains("xterm-256color frith"), "{text:?}");
-        assert!(!text.contains("\n0"), "no UTF-8 locale: {text:?}");
+        assert!(text.contains("xterm-256color frith UTF-8"), "{text:?}");
     }
 }
