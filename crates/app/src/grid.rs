@@ -232,7 +232,6 @@ impl Grid {
                 }
                 x += 1;
             }
-            let _ = row.set_dirty(false);
             y += 1;
         }
 
