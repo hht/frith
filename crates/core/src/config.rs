@@ -7,6 +7,7 @@
 //! `LineIterator.next` and `src/config/Config.zig` for the parsing rules followed here.
 
 use std::collections::BTreeMap;
+use std::time::Duration;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Rgb {
@@ -44,10 +45,14 @@ pub struct Config {
     pub unfocused_split_opacity: f32,
     /// The fade's color; `None` is the background.
     pub unfocused_split_fill: Option<Rgb>,
+    /// The duration of the spring panes move along when the arrangement changes; zero turns
+    /// the morph off. Frith's own key (ADR 10).
+    pub pane_move_duration: Duration,
 }
 
 /// Ghostty's defaults, so a Ghostty config that leaves a key out looks the same in Frith,
-/// except `background` and `foreground`, which are Frith's own, as is the `accent` key (ADR 14).
+/// except `background` and `foreground`, which are Frith's own, as are the `accent` key (ADR 14)
+/// and `pane-move-duration` (ADR 10).
 /// @see Ghostty `src/config/Config.zig` (`font-size`, `window-padding-x`, `window-padding-y`,
 /// `unfocused-split-opacity`, `unfocused-split-fill`)
 impl Default for Config {
@@ -64,6 +69,7 @@ impl Default for Config {
             padding_y: Padding { start: 2.0, end: 2.0 },
             unfocused_split_opacity: 0.7,
             unfocused_split_fill: None,
+            pane_move_duration: Duration::from_millis(500),
         }
     }
 }
@@ -135,6 +141,9 @@ impl Config {
             "unfocused-split-fill" => {
                 self.unfocused_split_fill = if empty { d.unfocused_split_fill } else { Some(color(value)?) }
             }
+            "pane-move-duration" => {
+                self.pane_move_duration = if empty { d.pane_move_duration } else { seconds(value)? }
+            }
             _ => return Ok(false),
         }
         Ok(true)
@@ -152,6 +161,13 @@ fn size(value: &str) -> Result<f32, String> {
 fn opacity(value: &str) -> Result<f32, String> {
     let v = value.parse::<f32>().ok().filter(|v| v.is_finite());
     v.map(|v| v.clamp(0.15, 1.0)).ok_or_else(|| format!("not a number: {value:?}"))
+}
+
+/// An animation's duration in seconds, 0 or more, clamped to 10 so a typo cannot keep the
+/// window drawing every frame for minutes (ADR 10).
+fn seconds(value: &str) -> Result<Duration, String> {
+    let s = value.parse::<f64>().ok().filter(|s| s.is_finite() && *s >= 0.0);
+    s.map(|s| Duration::from_secs_f64(s.min(10.0))).ok_or_else(|| format!("not a number of seconds: {value:?}"))
 }
 
 /// `#RRGGBB`, `RRGGBB`, `#RGB` or `RGB`. Ghostty also takes X11 names and `rgb:` forms.
@@ -322,6 +338,24 @@ pub(crate) mod tests {
         assert_eq!(c.accent, rgb(0x61afef));
         c.read("accent =\n");
         assert_eq!(c.accent, rgb(0xf6763e), "an empty value restores it");
+    }
+
+    #[test]
+    fn panes_move_for_apples_default_half_second_unless_configured() {
+        let mut c = Config::default();
+        assert_eq!(c.pane_move_duration, Duration::from_millis(500));
+        let notes = c.read("pane-move-duration = 0.25\n");
+        assert_eq!(notes, Notes::default());
+        assert_eq!(c.pane_move_duration, Duration::from_millis(250));
+        c.read("pane-move-duration = 1000\n");
+        assert_eq!(c.pane_move_duration, Duration::from_secs(10), "clamped, so a typo cannot animate for minutes");
+        c.read("pane-move-duration = 0\n");
+        assert_eq!(c.pane_move_duration, Duration::ZERO, "0 turns the morph off");
+        let notes = c.read("pane-move-duration = -1\npane-move-duration = nan\npane-move-duration = inf\n");
+        assert_eq!(notes.errors.len(), 3, "{notes:?}");
+        assert_eq!(c.pane_move_duration, Duration::ZERO, "a bad value keeps the earlier one");
+        c.read("pane-move-duration =\n");
+        assert_eq!(c.pane_move_duration, Duration::from_millis(500), "an empty value restores it");
     }
 
     #[test]

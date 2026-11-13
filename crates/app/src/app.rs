@@ -157,6 +157,7 @@ impl App {
             cfg,
             chrome: chrome_for(&config),
             fade: fade_for(&config),
+            motion: Motion::new(config.pane_move_duration),
             config,
             cache,
             proxy,
@@ -168,7 +169,6 @@ impl App {
             next_pane: 0,
             gesture: Gesture::Idle,
             gesture_revision: 0,
-            motion: Motion::default(),
             placed: Vec::new(),
             origins: HashMap::new(),
             placed_revision: 0,
@@ -435,7 +435,9 @@ impl App {
         // Only structural changes morph; dragged dividers and cards, and window resizes, keep
         // the revision and follow the pointer at once (ADR 10).
         let placed = placed(&scene);
-        let changed = self.layout.revision() != self.placed_revision && !reduce_motion();
+        // With panes not moving, a change captures nothing to morph from either.
+        let animate = !self.config.pane_move_duration.is_zero() && !reduce_motion();
+        let changed = self.layout.revision() != self.placed_revision && animate;
         let revision = std::mem::replace(&mut self.placed_revision, self.layout.revision());
         let before = std::mem::replace(&mut self.placed, placed.clone());
         let App { win, panes, layout, focus, hover, pointer, preedit, chrome, fade, motion, origins, .. } = self;

@@ -10,15 +10,6 @@ use std::time::{Duration, Instant};
 use crate::geom::Rect;
 use crate::layout::PaneId;
 
-/// SwiftUI's default `Spring()`: duration 0.5 s, bounce 0, which is critically damped with
-/// angular frequency 2π / 0.5. Measured on macOS 26.5: stiffness 157.91, damping 25.13.
-/// @see https://developer.apple.com/documentation/swiftui/spring
-const OMEGA: f32 = 2.0 * std::f32::consts::PI / 0.5;
-
-/// `Spring().settlingDuration`, measured on macOS 26.5: after it a spring stops on its target.
-/// What is left of the move then is under 0.05%, half a pixel over 1,000.
-const SETTLE: Duration = Duration::from_millis(800);
-
 /// One rect's offset from its target, as x, y, w, h, and how fast that offset changes, at
 /// `start`. It decays to zero along the spring, so a target that moves on its own (the window
 /// is resized) carries the pane along at once (ADR 10).
@@ -30,17 +21,18 @@ struct Spring {
 }
 
 impl Spring {
-    /// Offset and velocity at `now`: d(t) = (d0 + (v0 + ω d0) t) e^(−ω t).
-    fn at(&self, now: Instant) -> ([f32; 4], [f32; 4]) {
+    /// Offset and velocity at `now` for angular frequency `omega`:
+    /// d(t) = (d0 + (v0 + ω d0) t) e^(−ω t).
+    fn at(&self, omega: f32, now: Instant) -> ([f32; 4], [f32; 4]) {
         let t = now.saturating_duration_since(self.start).as_secs_f32();
-        let decay = (-OMEGA * t).exp();
+        let decay = (-omega * t).exp();
         let mut d = [0.0; 4];
         let mut v = [0.0; 4];
         for i in 0..4 {
             let (d0, v0) = (self.offset[i], self.velocity[i]);
-            let b = v0 + OMEGA * d0;
+            let b = v0 + omega * d0;
             d[i] = (d0 + b * t) * decay;
-            v[i] = (b - OMEGA * (d0 + b * t)) * decay;
+            v[i] = (b - omega * (d0 + b * t)) * decay;
         }
         (d, v)
     }
@@ -51,8 +43,11 @@ fn parts(r: Rect) -> [f32; 4] {
 }
 
 /// The springs of panes in flight, and the panes the latest change took out.
-#[derive(Default)]
 pub struct Motion {
+    /// The springs' angular frequency, 2π / duration.
+    omega: f32,
+    /// How long a spring runs before it stops on its target.
+    settle: Duration,
     springs: HashMap<PaneId, Spring>,
     /// Where each pane the latest change took out was drawn, and when the change came.
     left: Vec<(PaneId, Rect)>,
@@ -60,12 +55,33 @@ pub struct Motion {
 }
 
 impl Motion {
+    /// Panes move along SwiftUI's `Spring(duration:bounce: 0)`, which is critically damped with
+    /// angular frequency 2π / `duration`; measured on macOS 26.5, `Spring()` (0.5 s) has
+    /// stiffness 157.91 and damping 25.13. A spring stops on its target after 1.6 times
+    /// `duration`, when what is left of the move is under 0.05%, half a pixel over 1,000,
+    /// whatever the duration. That is `Spring().settlingDuration`, 0.8 s, but not Apple's for
+    /// every duration: measured, 0.1, 0.25, 1 and 2 s settle after 0.2, 0.4, 1.5 and 3 s, the
+    /// first multiple of 0.1 s at which under 0.1% is left. A zero `duration` moves nothing.
+    /// @see https://developer.apple.com/documentation/swiftui/spring
+    pub fn new(duration: Duration) -> Motion {
+        Motion {
+            omega: 2.0 * std::f32::consts::PI / duration.as_secs_f32(),
+            settle: duration.saturating_mul(8) / 5,
+            springs: HashMap::new(),
+            left: Vec::new(),
+            left_at: None,
+        }
+    }
+
     /// The arrangement changed at `now`: each pane had target rect `before` and now has
     /// `after`. A pane in both springs from where it is drawn at `now` and keeps its speed,
     /// so a change in mid-flight bends the path instead of jumping; a pane that comes back
     /// while still leaving springs from where it was left. Panes only in `before` start
     /// leaving; those still leaving from earlier changes stay so until those settle.
     pub fn retarget(&mut self, before: &[(PaneId, Rect)], after: &[(PaneId, Rect)], now: Instant) {
+        if self.settle.is_zero() {
+            return; // nothing moves, and the infinite `omega` stays out of the math
+        }
         let left: Vec<(PaneId, Rect)> = self.leaving(now).collect();
         let stays = |p: &PaneId| after.iter().any(|(q, _)| q == p);
         let gone: Vec<(PaneId, Rect)> =
@@ -75,7 +91,7 @@ impl Motion {
                 // Same target: its spring, if any, runs on unchanged.
                 Some(&(_, from)) if from == to => continue,
                 Some(&(_, from)) => {
-                    (self.rect(pane, from, now), self.live(pane, now).map_or([0.0; 4], |s| s.at(now).1))
+                    (self.rect(pane, from, now), self.live(pane, now).map_or([0.0; 4], |s| s.at(self.omega, now).1))
                 }
                 None => match left.iter().find(|(p, _)| *p == pane) {
                     Some(&(_, r)) => (r, [0.0; 4]),
@@ -103,7 +119,7 @@ impl Motion {
     /// Where `pane`, which the layout puts at `target`, is drawn at `now`.
     pub fn rect(&self, pane: PaneId, target: Rect, now: Instant) -> Rect {
         let Some(s) = self.live(pane, now) else { return target };
-        let (d, _) = s.at(now);
+        let (d, _) = s.at(self.omega, now);
         Rect::new(target.x + d[0], target.y + d[1], target.w + d[2], target.h + d[3])
     }
 
@@ -113,7 +129,7 @@ impl Motion {
     pub fn morph(&self, pane: PaneId, target: Rect, now: Instant) -> Option<(Rect, f32)> {
         let s = self.live(pane, now)?;
         let t = now.saturating_duration_since(s.start).as_secs_f32();
-        let progress = 1.0 - (1.0 + OMEGA * t) * (-OMEGA * t).exp();
+        let progress = 1.0 - (1.0 + self.omega * t) * (-self.omega * t).exp();
         Some((self.rect(pane, target, now), progress))
     }
 
@@ -121,7 +137,7 @@ impl Motion {
     /// that took one out settles: a tile a zoom hid can stay under the zoomed one growing
     /// over it. The caller picks which of them to draw.
     pub fn leaving(&self, now: Instant) -> impl Iterator<Item = (PaneId, Rect)> + '_ {
-        let live = self.left_at.is_some_and(|t| now < t + SETTLE);
+        let live = self.left_at.is_some_and(|t| now.saturating_duration_since(t) < self.settle);
         self.left.iter().copied().filter(move |_| live)
     }
 
@@ -132,13 +148,13 @@ impl Motion {
 
     /// `pane`'s spring, unless it has come to rest by `now`.
     fn live(&self, pane: PaneId, now: Instant) -> Option<&Spring> {
-        self.springs.get(&pane).filter(|s| now < s.start + SETTLE)
+        self.springs.get(&pane).filter(|s| now.saturating_duration_since(s.start) < self.settle)
     }
 
     /// Drops the springs that have come to rest by `now`; returns whether any still moves.
     pub fn settle(&mut self, now: Instant) -> bool {
-        self.springs.retain(|_, s| now < s.start + SETTLE);
-        if self.left_at.is_some_and(|t| now >= t + SETTLE) {
+        self.springs.retain(|_, s| now.saturating_duration_since(s.start) < self.settle);
+        if self.left_at.is_some_and(|t| now.saturating_duration_since(t) >= self.settle) {
             self.left.clear();
             self.left_at = None;
         }
@@ -156,6 +172,11 @@ mod tests {
         t0 + Duration::from_secs_f64(secs)
     }
 
+    /// SwiftUI's default `Spring()`.
+    fn apple() -> Motion {
+        Motion::new(Duration::from_millis(500))
+    }
+
     fn close(a: f32, b: f32) -> bool {
         (a - b).abs() < 1e-3
     }
@@ -166,7 +187,7 @@ mod tests {
     fn a_moved_pane_starts_where_it_was_and_follows_apples_default_spring() {
         let t0 = Instant::now();
         let (from, to) = (Rect::new(0.0, 0.0, 100.0, 100.0), Rect::new(100.0, 0.0, 100.0, 100.0));
-        let mut m = Motion::default();
+        let mut m = apple();
         m.retarget(&[(A, from)], &[(A, to)], t0);
         assert_eq!(m.rect(A, to, t0), from, "no jump when the move begins");
         let r = m.rect(A, to, at(t0, 0.05));
@@ -180,7 +201,7 @@ mod tests {
     fn a_pane_sent_elsewhere_in_flight_keeps_its_place_and_speed() {
         let t0 = Instant::now();
         let r = |x| Rect::new(x, 0.0, 100.0, 100.0);
-        let mut m = Motion::default();
+        let mut m = apple();
         m.retarget(&[(A, r(0.0))], &[(A, r(100.0))], t0);
         let t1 = at(t0, 0.1);
         assert!(close(m.rect(A, r(100.0), t1).x, 35.7740));
@@ -194,7 +215,7 @@ mod tests {
     fn a_pane_comes_to_rest_on_its_target_after_apples_settling_time() {
         let t0 = Instant::now();
         let (from, to) = (Rect::new(0.0, 0.0, 100.0, 100.0), Rect::new(500.0, 40.0, 300.0, 200.0));
-        let mut m = Motion::default();
+        let mut m = apple();
         m.retarget(&[(A, from)], &[(A, to)], t0);
         assert!(m.settle(at(t0, 0.79)), "still moving");
         assert_ne!(m.rect(A, to, at(t0, 0.79)), to);
@@ -203,11 +224,45 @@ mod tests {
     }
 
     #[test]
+    fn a_longer_duration_stretches_the_spring_and_its_settling_in_proportion() {
+        // `Spring(duration: 1)` at 0.1 s is `Spring()` at 0.05 s: 13.1311 of 100.
+        let t0 = Instant::now();
+        let (from, to) = (Rect::new(0.0, 0.0, 100.0, 100.0), Rect::new(100.0, 0.0, 100.0, 100.0));
+        let mut m = Motion::new(Duration::from_secs(1));
+        m.retarget(&[(A, from)], &[(A, to)], t0);
+        assert!(close(m.rect(A, to, at(t0, 0.1)).x, 13.1311));
+        assert!(m.settle(at(t0, 1.59)), "still moving");
+        assert!(!m.settle(at(t0, 1.6)), "settles after 1.6 times its duration");
+    }
+
+    #[test]
+    fn a_zero_duration_puts_panes_on_their_targets_at_once() {
+        let t0 = Instant::now();
+        let (a, b) = (Rect::new(0.0, 0.0, 100.0, 100.0), Rect::new(100.0, 0.0, 100.0, 100.0));
+        let mut m = Motion::new(Duration::ZERO);
+        m.retarget(&[(A, a), (PaneId(2), b)], &[(A, b)], t0);
+        assert_eq!(m.rect(A, b, t0), b);
+        assert_eq!(m.morph(A, b, t0), None);
+        assert_eq!(m.leaving(t0).count(), 0, "a pane taken out is gone at once");
+        assert!(!m.settle(t0));
+    }
+
+    #[test]
+    fn an_absurd_duration_from_the_config_moves_slowly_without_overflowing() {
+        let t0 = Instant::now();
+        let (from, to) = (Rect::new(0.0, 0.0, 100.0, 100.0), Rect::new(100.0, 0.0, 100.0, 100.0));
+        let mut m = Motion::new(Duration::from_secs_f32(1e19));
+        m.retarget(&[(A, from)], &[(A, to)], t0);
+        assert!(m.settle(at(t0, 1.0)), "still moving");
+        assert_eq!(m.leaving(at(t0, 1.0)).count(), 0);
+    }
+
+    #[test]
     fn a_target_that_moves_on_its_own_carries_the_pane_along_at_once() {
         // The window is resized mid-flight: no new spring, the pane follows by the same amount.
         let t0 = Instant::now();
         let (from, to) = (Rect::new(0.0, 0.0, 100.0, 100.0), Rect::new(100.0, 0.0, 100.0, 100.0));
-        let mut m = Motion::default();
+        let mut m = apple();
         m.retarget(&[(A, from)], &[(A, to)], t0);
         let t = at(t0, 0.05);
         let grown = Rect::new(100.0, 0.0, 160.0, 100.0);
@@ -220,7 +275,7 @@ mod tests {
         let t0 = Instant::now();
         let (r, s) = (Rect::new(0.0, 0.0, 100.0, 100.0), Rect::new(0.0, 0.0, 50.0, 100.0));
         let b = PaneId(2);
-        let mut m = Motion::default();
+        let mut m = apple();
         m.retarget(&[(A, r)], &[(A, r), (b, s)], t0);
         assert_eq!(m.rect(A, r, at(t0, 0.05)), r);
         assert_eq!(m.rect(b, s, at(t0, 0.05)), s, "a new pane opens in place");
@@ -234,7 +289,7 @@ mod tests {
         let b = PaneId(2);
         let (a_rect, b_rect, full) =
             (Rect::new(0.0, 0.0, 100.0, 100.0), Rect::new(101.0, 0.0, 99.0, 100.0), Rect::new(0.0, 0.0, 200.0, 100.0));
-        let mut m = Motion::default();
+        let mut m = apple();
         m.retarget(&[(A, a_rect), (b, b_rect)], &[(b, full)], t0);
         assert_eq!(m.leaving(at(t0, 0.79)).collect::<Vec<_>>(), vec![(A, a_rect)]);
         assert_eq!(m.leaving(at(t0, 0.8)).count(), 0, "gone once the change settles");
@@ -253,7 +308,7 @@ mod tests {
             Rect::new(0.0, 0.0, 200.0, 100.0),
             Rect::new(50.0, 50.0, 40.0, 40.0),
         );
-        let mut m = Motion::default();
+        let mut m = apple();
         m.retarget(&[(A, a_rect), (b, b_rect), (c, card)], &[(b, full), (c, card)], t0);
         m.retarget(&[(b, full), (c, card)], &[(b, full), (c, card)], at(t0, 0.3));
         assert_eq!(m.leaving(at(t0, 0.5)).collect::<Vec<_>>(), vec![(A, a_rect)]);
@@ -272,7 +327,7 @@ mod tests {
             Rect::new(101.0, 0.0, 99.0, 100.0),
             Rect::new(0.0, 0.0, 200.0, 100.0),
         );
-        let mut m = Motion::default();
+        let mut m = apple();
         m.retarget(&[(A, whole)], &[(A, half), (b, other)], t0);
         let t1 = at(t0, 0.1);
         let left = m.rect(A, half, t1);
@@ -289,7 +344,7 @@ mod tests {
         // `Spring().value(target: 1, initialVelocity: 0, time: 0.05)` is 0.131311.
         let t0 = Instant::now();
         let (from, to) = (Rect::new(0.0, 0.0, 100.0, 100.0), Rect::new(100.0, 0.0, 100.0, 100.0));
-        let mut m = Motion::default();
+        let mut m = apple();
         m.retarget(&[(A, from)], &[(A, to)], t0);
         let (r, progress) = m.morph(A, to, at(t0, 0.05)).expect("morphing");
         assert_eq!(r, m.rect(A, to, at(t0, 0.05)));
@@ -301,7 +356,7 @@ mod tests {
     fn a_change_that_leaves_a_panes_target_alone_lets_its_morph_run_on() {
         let t0 = Instant::now();
         let (from, to) = (Rect::new(0.0, 0.0, 100.0, 100.0), Rect::new(100.0, 0.0, 100.0, 100.0));
-        let mut m = Motion::default();
+        let mut m = apple();
         m.retarget(&[(A, from)], &[(A, to)], t0);
         m.retarget(&[(A, to)], &[(A, to)], at(t0, 0.1)); // a card was raised
         // `Spring().value(target: 1, initialVelocity: 0, time: 0.15)` is 0.561960: timed from
@@ -314,7 +369,7 @@ mod tests {
     fn a_pane_at_rest_stays_at_rest_when_its_target_does_not_change() {
         let t0 = Instant::now();
         let (from, to) = (Rect::new(0.0, 0.0, 100.0, 100.0), Rect::new(100.0, 0.0, 100.0, 100.0));
-        let mut m = Motion::default();
+        let mut m = apple();
         m.retarget(&[(A, from)], &[(A, to)], t0);
         m.retarget(&[(A, to)], &[(A, to)], at(t0, 0.9)); // settled, but `settle` never ran
         assert!(!m.settle(at(t0, 0.9)), "no new spring from the old one's leftover speed");
