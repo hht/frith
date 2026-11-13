@@ -39,7 +39,7 @@ use crate::fonts::{self, Fonts};
 use crate::gpu::Gpu;
 use crate::grid::Grid;
 use crate::render;
-use crate::stage::{self, Kind, Origin, Pane, Shape, Stage};
+use crate::stage::{Kind, Origin, Pane, Stage};
 use crate::{Cfg, unescape};
 
 /// Upper bound on PTY bytes parsed per pane per wake-up, so one flooding pane cannot starve
@@ -388,29 +388,25 @@ impl App {
 
     // ---- drawing -----------------------------------------------------------------------
 
+    /// Fits each shown pane's terminal to its content rect; returns when a gathered resize is
+    /// due (see `Session::resize`).
+    fn resize_sessions(&mut self, scene: &Scene) -> Option<Instant> {
+        let mut due = None;
+        for f in scene.tiles.iter().chain(&scene.cards) {
+            let size = self.grid_size(f.content);
+            let pane = self.panes.get_mut(&f.pane).expect("every placed pane exists");
+            due = [due, pane.session.resize(size, Instant::now())].into_iter().flatten().min();
+        }
+        due
+    }
+
     fn draw(&mut self) {
         if self.win.is_none() {
             return;
         }
         let scene = self.scene();
-        let mut frame_due = None;
-        for f in scene.tiles.iter().chain(&scene.cards) {
-            let size = self.grid_size(f.content);
-            let pane = self.panes.get_mut(&f.pane).expect("every placed pane exists");
-            frame_due = [frame_due, pane.session.resize(size, Instant::now())].into_iter().flatten().min();
-        }
-        let lit = match (self.gesture, self.hover) {
-            (Gesture::DraggingDivider(i), _) | (_, Hit::Divider(i)) => Some(i),
-            _ => None,
-        };
-        let guides = self.drag.as_ref().map(|d| {
-            let preview = d.guides.active.map(|drop| {
-                let zone = self.layout.drop_preview(scene.area, scene.metrics.gap, d.pane, drop);
-                (zone, drop_label(drop))
-            });
-            (d.guides.clone(), preview)
-        });
-        let title = self.focus.map(|p| self.panes[&p].title.clone()).unwrap_or_default();
+        let frame_due = self.resize_sessions(&scene);
+        let (lit, guides) = (self.lit_divider(), self.drag_guides(&scene));
         let shot = self.shot.take();
         let hovered = hit_pane(self.hover);
         let pad = self.pad();
@@ -451,43 +447,20 @@ impl App {
                 // Each pane about to move starts from the shape it shows now, mid-morph or
                 // not. One turning into or out of its chip, or already fading an image, also
                 // starts from an image of what is on screen; others draw live (see `stage`).
-                for &(pane, from, kind) in &before {
+                for &was @ (pane, from, _) in &before {
                     let Some(&(_, to, next)) = placed.iter().find(|(p, ..)| *p == pane) else { continue };
                     if to == from {
                         continue;
                     }
-                    let old = origins.remove(&pane);
-                    let shown = motion.morph(pane, from, now);
-                    let rest = stage.shape(kind, scale);
-                    let shape = match shown {
-                        Some((r, progress)) => {
-                            let start = old.as_ref().map_or(rest, |o| o.shape);
-                            let image_w = old.as_ref().and_then(|o| o.image.as_ref()).map_or(1.0, |i| i.width() as f32);
-                            let b = stage::blend(start, rest, image_w, from, r, progress);
-                            let kind = if progress < 0.5 { start.kind } else { kind };
-                            Shape { kind, corner: b.corner, card: b.card }
-                        }
-                        None => rest,
-                    };
-                    let fading = shown.is_some() && old.as_ref().is_some_and(|o| o.image.is_some());
-                    let image = (fading || (kind == Kind::Chip) != (next == Kind::Chip))
-                        .then(|| {
-                            let drawn = shown.map_or(from, |(r, _)| r);
-                            stage.capture(&mut pen, ctx, drawn, |st, pen, ctx| match shown {
-                                Some((r, progress)) => {
-                                    st.morph(pen, ctx, pane, kind, from, r, progress, old.as_ref());
-                                }
-                                None => st.live(pen, ctx, pane, rest, from),
-                            })
-                        })
-                        .flatten();
-                    origins.insert(pane, Origin { shape, image });
+                    let (old, shown) = (origins.remove(&pane), motion.morph(pane, from, now));
+                    origins.insert(pane, stage.origin(&mut pen, ctx, was, next, shown, old));
                 }
                 motion.retarget(&rects(&before), &rects(&placed), now);
             }
             moving = motion.settle(now);
             origins.retain(|p, _| motion.moving(*p, now));
-            let motion = &*motion;
+            let (motion, origins) = (&*motion, &*origins);
+            let morph = |pane, target| motion.morph(pane, target, now).map(|(r, p)| (r, p, origins.get(&pane)));
             render::background(&pen, &scene);
             // Tiles a zoom just hid stay under the zoomed one growing over them; then tiles at
             // rest, so a moving tile uncovers what it makes room for (a new split).
@@ -497,44 +470,26 @@ impl App {
                 tiles_moving = true;
             }
             let (resting, morphing): (Vec<_>, Vec<_>) =
-                scene.tiles.iter().partition(|f| motion.morph(f.pane, f.outer, now).is_none());
-            for f in resting {
-                stage.live(&mut pen, ctx, f.pane, stage.shape(Kind::Tile, scale), f.outer);
-            }
-            for f in &morphing {
-                let (r, progress) = motion.morph(f.pane, f.outer, now).expect("partitioned as morphing");
-                stage.morph(&mut pen, ctx, f.pane, Kind::Tile, f.outer, r, progress, origins.get(&f.pane));
+                scene.tiles.iter().partition(|f| morph(f.pane, f.outer).is_none());
+            for f in resting.iter().chain(&morphing) {
+                stage.show(&mut pen, ctx, f.pane, Kind::Tile, f.outer, morph(f.pane, f.outer));
             }
             // Dividers sit where tiles end up; while tiles move, the gaps show instead.
             if !tiles_moving && morphing.is_empty() {
                 render::dividers(&pen, &scene.dividers, lit);
             }
             for f in &scene.cards {
-                match motion.morph(f.pane, f.outer, now) {
-                    Some((r, progress)) => {
-                        stage.morph(&mut pen, ctx, f.pane, Kind::Card, f.outer, r, progress, origins.get(&f.pane));
-                    }
-                    None => {
-                        let card = stage.shape(Kind::Card, scale);
-                        render::card_shadow(&pen, f.outer, card.corner, 1.0);
-                        stage.live(&mut pen, ctx, f.pane, card, f.outer);
-                    }
-                }
+                stage.show(&mut pen, ctx, f.pane, Kind::Card, f.outer, morph(f.pane, f.outer));
             }
             if scene.tiles.is_empty() {
                 render::empty_state(&mut pen, scene.area);
             }
             render::top_bar(&pen, &scene, hover);
             // Chips at rest, then panes on their way into or along the dock bar, above it.
-            for &(pane, chip) in &scene.chips {
-                if motion.morph(pane, chip, now).is_none() {
-                    stage.live(&mut pen, ctx, pane, stage.shape(Kind::Chip, scale), chip);
-                }
-            }
-            for &(pane, chip) in &scene.chips {
-                if let Some((r, progress)) = motion.morph(pane, chip, now) {
-                    stage.morph(&mut pen, ctx, pane, Kind::Chip, chip, r, progress, origins.get(&pane));
-                }
+            let (resting, morphing): (Vec<_>, Vec<_>) =
+                scene.chips.iter().partition(|&&(p, chip)| morph(p, chip).is_none());
+            for &(pane, chip) in resting.into_iter().chain(morphing) {
+                stage.show(&mut pen, ctx, pane, Kind::Chip, chip, morph(pane, chip));
             }
             if let Some((guides, preview)) = &guides {
                 let preview = preview.as_ref().map(|(zone, text)| (*zone, text.as_str()));
@@ -556,16 +511,43 @@ impl App {
             return;
         };
         self.frame_due = [frame_due, held].into_iter().flatten().min();
+        self.sync_window(cursor);
+    }
+
+    /// The divider drawn in the accent: the one dragged, else the one under the pointer.
+    fn lit_divider(&self) -> Option<usize> {
+        match (self.gesture, self.hover) {
+            (Gesture::DraggingDivider(i), _) | (_, Hit::Divider(i)) => Some(i),
+            _ => None,
+        }
+    }
+
+    /// While a pane is dragged, its dock guides and, over an active one, the zone a drop would
+    /// fill with its label.
+    fn drag_guides(&self, scene: &Scene) -> Option<(Guides, Option<(Rect, String)>)> {
+        self.drag.as_ref().map(|d| {
+            let preview = d.guides.active.map(|drop| {
+                let zone = self.layout.drop_preview(scene.area, scene.metrics.gap, d.pane, drop);
+                (zone, drop_label(drop))
+            });
+            (d.guides.clone(), preview)
+        })
+    }
+
+    /// Points the IME at the focused cursor where it was drawn, and titles the window after
+    /// the focused pane, each only when it changed.
+    fn sync_window(&mut self, cursor: Option<SkRect>) {
         if let Some(c) = cursor.filter(|c| self.ime_area != Some(*c)) {
             self.ime_area = Some(c);
             let area = ImeRequestData::default().with_cursor_area(
                 PhysicalPosition::new(c.left as i32, c.top as i32).into(),
                 PhysicalSize::new(c.width() as u32, c.height() as u32).into(),
             );
-            let _ = w.window.request_ime_update(ImeRequest::Update(area));
+            let _ = self.win().window.request_ime_update(ImeRequest::Update(area));
         }
+        let title = self.focus.map(|p| self.panes[&p].title.clone()).unwrap_or_default();
         if title != self.title {
-            w.window.set_title(if title.is_empty() { "Frith" } else { &title });
+            self.win().window.set_title(if title.is_empty() { "Frith" } else { &title });
             self.title = title;
         }
     }

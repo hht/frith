@@ -181,6 +181,71 @@ impl Stage<'_> {
         }
     }
 
+    /// How `pane` looks as its change to a `next` begins, for its morph to start from. It was
+    /// placed as `kind` at `from`; `shown` is its morph there (rect and progress) if it still
+    /// moves, and `old` that morph's origin, if any. The shape is the one on screen. An image of
+    /// it is captured too when it turns into or out of its chip, or when it still moves while
+    /// fading an earlier image (see the module doc).
+    pub fn origin(
+        &mut self,
+        pen: &mut Pen,
+        ctx: &mut DirectContext,
+        (pane, from, kind): (PaneId, Rect, Kind),
+        next: Kind,
+        shown: Option<(Rect, f32)>,
+        old: Option<Origin>,
+    ) -> Origin {
+        let rest = self.shape(kind, pen.scale);
+        let shape = match shown {
+            Some((r, progress)) => {
+                let start = old.as_ref().map_or(rest, |o| o.shape);
+                let image_w = old.as_ref().and_then(|o| o.image.as_ref()).map_or(1.0, |i| i.width() as f32);
+                let b = blend(start, rest, image_w, from, r, progress);
+                let kind = if progress < 0.5 { start.kind } else { kind };
+                Shape { kind, corner: b.corner, card: b.card }
+            }
+            None => rest,
+        };
+        let fading = shown.is_some() && old.as_ref().is_some_and(|o| o.image.is_some());
+        let image = (fading || (kind == Kind::Chip) != (next == Kind::Chip))
+            .then(|| {
+                let drawn = shown.map_or(from, |(r, _)| r);
+                self.capture(pen, ctx, drawn, |st, pen, ctx| match shown {
+                    Some((r, progress)) => {
+                        st.morph(pen, ctx, pane, kind, from, r, progress, old.as_ref());
+                    }
+                    None => st.live(pen, ctx, pane, rest, from),
+                })
+            })
+            .flatten();
+        Origin { shape, image }
+    }
+
+    /// Paints `pane` as a `kind` the layout puts at `target`: morphing when `morph` gives its
+    /// rect, progress and origin this frame, else at rest, a card with its shadow.
+    pub fn show(
+        &mut self,
+        pen: &mut Pen,
+        ctx: &mut DirectContext,
+        pane: PaneId,
+        kind: Kind,
+        target: Rect,
+        morph: Option<(Rect, f32, Option<&Origin>)>,
+    ) {
+        match morph {
+            Some((r, progress, origin)) => {
+                self.morph(pen, ctx, pane, kind, target, r, progress, origin);
+            }
+            None => {
+                let shape = self.shape(kind, pen.scale);
+                if kind == Kind::Card {
+                    render::card_shadow(pen, target, shape.corner, 1.0);
+                }
+                self.live(pen, ctx, pane, shape, target);
+            }
+        }
+    }
+
     /// Paints `pane` morphing from `from` (by default its shape at rest as `kind`) into a
     /// `kind` at `target`, drawn at `r`, `progress` (0 to 1) of the way (see `blend`): clipped
     /// to `r` with the blended corner, a card's shadow and border at the blended strength, and
