@@ -6,4 +6,5 @@ pub mod config;
 pub mod geom;
 pub mod gesture;
 pub mod layout;
+pub mod motion;
 pub mod scene;

@@ -23,6 +23,7 @@ mod pty;
 mod render;
 mod shell;
 mod sprite;
+mod stage;
 mod term;
 
 use std::path::PathBuf;

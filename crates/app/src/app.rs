@@ -17,9 +17,10 @@ use frith_core::config::{Config, Rgb};
 use frith_core::geom::{Point, Rect};
 use frith_core::gesture::{Effect, Gesture};
 use frith_core::layout::{Axis, Drop, Edge, Layout, PaneId};
+use frith_core::motion::Motion;
 use frith_core::scene::{self, ChromeButton, Frame, Guides, Hit, Metrics, PaneButton, Resize, Scene};
 use libghostty_vt::mouse;
-use skia_safe::{Color, Rect as SkRect};
+use skia_safe::Rect as SkRect;
 use winit::application::ApplicationHandler;
 use winit::cursor::CursorIcon;
 use winit::dpi::{LogicalSize, PhysicalPosition, PhysicalSize};
@@ -34,10 +35,11 @@ use winit::window::{
 use crate::atlas::Atlas;
 use crate::fonts::{self, Fonts};
 use crate::gpu::Gpu;
-use crate::grid::{self, Grid};
+use crate::grid::Grid;
 use crate::pty::Program;
-use crate::render::{self, PaneLook};
+use crate::render;
 use crate::shell;
+use crate::stage::{self, Kind, Origin, Pane, Shape, Stage};
 use crate::term::{GridSize, Pad, Session};
 use crate::{Cfg, unescape};
 
@@ -54,14 +56,6 @@ const UI_TEXT: f32 = 12.0;
 const DRAG_THRESHOLD: f32 = 4.0;
 const MIN_TILE: f32 = 80.0;
 const MIN_CARD: (f32, f32) = (240.0, 120.0);
-
-struct Pane {
-    session: Session,
-    grid: Grid,
-    title: String,
-    /// An OSC 9/777 notification arrived while the pane was not focused.
-    attention: bool,
-}
 
 /// The root window and everything that depends on its scale factor.
 struct Win {
@@ -118,6 +112,14 @@ pub struct App {
     focus: Option<PaneId>,
     next_pane: u32,
     gesture: Gesture,
+    /// Pane springs between arrangements (ADR 10).
+    motion: Motion,
+    /// Each pane's rect and kind when last drawn, and `layout.revision()` then: a new
+    /// revision morphs panes from these.
+    placed: Vec<(PaneId, Rect, Kind)>,
+    placed_revision: u64,
+    /// Where each morphing pane's morph began.
+    origins: HashMap<PaneId, Origin>,
     /// `layout.revision()` when the current gesture began; a structural change since then
     /// makes the panes and divider indices it captured stale.
     gesture_revision: u64,
@@ -154,6 +156,10 @@ impl App {
             next_pane: 0,
             gesture: Gesture::Idle,
             gesture_revision: 0,
+            motion: Motion::default(),
+            placed: Vec::new(),
+            origins: HashMap::new(),
+            placed_revision: 0,
             drag: None,
             resizing: None,
             pointer: Point::default(),
@@ -388,12 +394,11 @@ impl App {
             return;
         }
         let scene = self.scene();
-        let now = Instant::now();
         let mut frame_due = None;
         for f in scene.tiles.iter().chain(&scene.cards) {
             let size = self.grid_size(f.content);
             let pane = self.panes.get_mut(&f.pane).expect("every placed pane exists");
-            frame_due = [frame_due, pane.session.resize(size, now)].into_iter().flatten().min();
+            frame_due = [frame_due, pane.session.resize(size, Instant::now())].into_iter().flatten().min();
         }
         let lit = match (self.gesture, self.hover) {
             (Gesture::DraggingDivider(i), _) | (_, Hit::Divider(i)) => Some(i),
@@ -411,74 +416,147 @@ impl App {
         let hovered = hit_pane(self.hover);
         let pad = self.pad();
         let pad = (pad.left as f32, pad.top as f32);
-        let App { win, panes, layout, focus, hover, pointer, preedit, chrome, fade, .. } = self;
+        // Only structural changes morph; dragged dividers and cards, and window resizes, keep
+        // the revision and follow the pointer at once (ADR 10).
+        let placed = placed(&scene);
+        let changed = self.layout.revision() != self.placed_revision && !reduce_motion();
+        let revision = std::mem::replace(&mut self.placed_revision, self.layout.revision());
+        let before = std::mem::replace(&mut self.placed, placed.clone());
+        let App { win, panes, layout, focus, hover, pointer, preedit, chrome, fade, motion, origins, .. } = self;
         let fade = fade.filter(|_| scene.tiles.len() + scene.cards.len() > 1);
-        let chrome = &*chrome;
-        let layout = &*layout;
-        let (focus, hover, pointer) = (*focus, *hover, *pointer);
+        let (layout, focus, hover, pointer) = (&*layout, *focus, *hover, *pointer);
         let w = win.as_mut().expect("window");
         let Win { gpu, fonts, ui, atlas, scale, .. } = w;
         let scale = *scale;
-        let cursor = gpu.present(shot.as_deref(), |canvas, ctx| {
+        let mut moving = false;
+        let drawn = gpu.present(shot.as_deref(), |canvas, ctx| {
+            // Sampled once the drawable is in hand, so each frame is timed by when it shows
+            // rather than when it was asked for (CLAUDE.md principle 3).
+            let now = Instant::now();
             let mut pen = render::Pen { canvas, chrome, ui, fonts, scale };
+            let mut stage = Stage {
+                panes,
+                atlas,
+                metrics: &scene.metrics,
+                focus,
+                hovered,
+                hover,
+                zoomed: layout.zoomed(),
+                fade,
+                pad,
+                now,
+                frame_due: None,
+                cursor: None,
+            };
+            if changed {
+                // Each pane about to move starts from the shape it shows now, mid-morph or
+                // not. One turning into or out of its chip, or already fading an image, also
+                // starts from an image of what is on screen; others draw live (see `stage`).
+                for &(pane, from, kind) in &before {
+                    let Some(&(_, to, next)) = placed.iter().find(|(p, ..)| *p == pane) else { continue };
+                    if to == from {
+                        continue;
+                    }
+                    let old = origins.remove(&pane);
+                    let shown = motion.morph(pane, from, now);
+                    let rest = stage.shape(kind, scale);
+                    let shape = match shown {
+                        Some((r, progress)) => {
+                            let start = old.as_ref().map_or(rest, |o| o.shape);
+                            let image_w = old.as_ref().and_then(|o| o.image.as_ref()).map_or(1.0, |i| i.width() as f32);
+                            let b = stage::blend(start, rest, image_w, from, r, progress);
+                            let kind = if progress < 0.5 { start.kind } else { kind };
+                            Shape { kind, corner: b.corner, card: b.card }
+                        }
+                        None => rest,
+                    };
+                    let fading = shown.is_some() && old.as_ref().is_some_and(|o| o.image.is_some());
+                    let image = (fading || (kind == Kind::Chip) != (next == Kind::Chip))
+                        .then(|| {
+                            let drawn = shown.map_or(from, |(r, _)| r);
+                            stage.capture(&mut pen, ctx, drawn, |st, pen, ctx| match shown {
+                                Some((r, progress)) => {
+                                    st.morph(pen, ctx, pane, kind, from, r, progress, old.as_ref());
+                                }
+                                None => st.live(pen, ctx, pane, rest, from),
+                            })
+                        })
+                        .flatten();
+                    origins.insert(pane, Origin { shape, image });
+                }
+                motion.retarget(&rects(&before), &rects(&placed), now);
+            }
+            moving = motion.settle(now);
+            origins.retain(|p, _| motion.moving(*p, now));
+            let motion = &*motion;
             render::background(&pen, &scene);
-            let mut cursor = None;
-            let zoomed = layout.zoomed();
-            for (f, card) in scene.tiles.iter().map(|f| (f, false)).chain(scene.cards.iter().map(|f| (f, true))) {
-                if card {
-                    render::card_under(&pen, f);
-                }
-                let p = panes.get_mut(&f.pane).expect("every placed pane exists");
-                let focused = Some(f.pane) == focus;
-                let held = p.session.hold(now);
-                frame_due = [frame_due, held].into_iter().flatten().min();
-                let c = SkRect::from_xywh(f.content.x, f.content.y, f.content.w, f.content.h);
-                let look = grid::Look {
-                    content: c,
-                    pad,
-                    focused,
-                    cursor: Color::from_rgb(pen.chrome.accent.r, pen.chrome.accent.g, pen.chrome.accent.b),
-                    update: held.is_none(),
-                };
-                let at = p.grid.draw(canvas, pen.fonts, atlas, ctx, &p.session.term, &look);
-                if let Some(t) = fade.filter(|_| !focused) {
-                    render::fade(&pen, f.content, t);
-                }
-                if focused {
-                    cursor = at;
-                }
-                let look = PaneLook {
-                    title: &p.title,
-                    focused,
-                    hovered: hovered == Some(f.pane),
-                    attention: p.attention,
-                    zoomed: zoomed == Some(f.pane),
-                };
-                if card {
-                    render::card_over(&mut pen, f, &look, hover);
-                } else {
-                    render::tile_header(&mut pen, f, &look, hover);
-                }
-                if !card && Some(f) == scene.tiles.last() {
-                    render::dividers(&pen, &scene.dividers, lit);
+            // Tiles a zoom just hid stay under the zoomed one growing over them; then tiles at
+            // rest, so a moving tile uncovers what it makes room for (a new split).
+            let mut tiles_moving = false;
+            for (pane, r) in motion.leaving(now).filter(|(p, _)| layout.is_tiled(*p)) {
+                stage.live(&mut pen, ctx, pane, stage.shape(Kind::Tile, scale), r);
+                tiles_moving = true;
+            }
+            let (resting, morphing): (Vec<_>, Vec<_>) =
+                scene.tiles.iter().partition(|f| motion.morph(f.pane, f.outer, now).is_none());
+            for f in resting {
+                stage.live(&mut pen, ctx, f.pane, stage.shape(Kind::Tile, scale), f.outer);
+            }
+            for f in &morphing {
+                let (r, progress) = motion.morph(f.pane, f.outer, now).expect("partitioned as morphing");
+                stage.morph(&mut pen, ctx, f.pane, Kind::Tile, f.outer, r, progress, origins.get(&f.pane));
+            }
+            // Dividers sit where tiles end up; while tiles move, the gaps show instead.
+            if !tiles_moving && morphing.is_empty() {
+                render::dividers(&pen, &scene.dividers, lit);
+            }
+            for f in &scene.cards {
+                match motion.morph(f.pane, f.outer, now) {
+                    Some((r, progress)) => {
+                        stage.morph(&mut pen, ctx, f.pane, Kind::Card, f.outer, r, progress, origins.get(&f.pane));
+                    }
+                    None => {
+                        let card = stage.shape(Kind::Card, scale);
+                        render::card_shadow(&pen, f.outer, card.corner, 1.0);
+                        stage.live(&mut pen, ctx, f.pane, card, f.outer);
+                    }
                 }
             }
             if scene.tiles.is_empty() {
                 render::empty_state(&mut pen, scene.area);
             }
             render::top_bar(&pen, &scene, hover);
-            render::dock(&mut pen, &scene, |p| (panes[&p].title.clone(), panes[&p].attention), hover);
+            // Chips at rest, then panes on their way into or along the dock bar, above it.
+            for &(pane, chip) in &scene.chips {
+                if motion.morph(pane, chip, now).is_none() {
+                    stage.live(&mut pen, ctx, pane, stage.shape(Kind::Chip, scale), chip);
+                }
+            }
+            for &(pane, chip) in &scene.chips {
+                if let Some((r, progress)) = motion.morph(pane, chip, now) {
+                    stage.morph(&mut pen, ctx, pane, Kind::Chip, chip, r, progress, origins.get(&pane));
+                }
+            }
             if let Some((guides, preview)) = &guides {
                 let preview = preview.as_ref().map(|(zone, text)| (*zone, text.as_str()));
                 render::dock_guides(&mut pen, &scene, guides, preview, pointer);
             }
-            if let Some(c) = cursor {
+            if let Some(c) = stage.cursor {
                 render::preedit(&mut pen, c, preedit);
             }
-            cursor
+            (stage.cursor, stage.frame_due)
         });
-        self.frame_due = frame_due;
-        let Some(cursor) = cursor else { return };
+        if moving {
+            w.window.request_redraw();
+        }
+        let Some((cursor, held)) = drawn else {
+            // Nothing drew, so no change began: the next frame starts it.
+            self.frame_due = frame_due;
+            self.placed = before;
+            self.placed_revision = revision;
+            return;
+        };
+        self.frame_due = [frame_due, held].into_iter().flatten().min();
         if let Some(c) = cursor.filter(|c| self.ime_area != Some(*c)) {
             self.ime_area = Some(c);
             let area = ImeRequestData::default().with_cursor_area(
@@ -859,6 +937,17 @@ impl App {
     }
 }
 
+/// Where each pane sits and what it shows as: tiles, cards, then dock chips.
+fn placed(scene: &Scene) -> Vec<(PaneId, Rect, Kind)> {
+    let tiles = scene.tiles.iter().map(|f| (f.pane, f.outer, Kind::Tile));
+    let cards = scene.cards.iter().map(|f| (f.pane, f.outer, Kind::Card));
+    tiles.chain(cards).chain(scene.chips.iter().map(|&(p, r)| (p, r, Kind::Chip))).collect()
+}
+
+fn rects(placed: &[(PaneId, Rect, Kind)]) -> Vec<(PaneId, Rect)> {
+    placed.iter().map(|&(p, r, _)| (p, r)).collect()
+}
+
 /// The tile or card frame of `pane`, if it is visible.
 fn frame_of(scene: &Scene, pane: PaneId) -> Option<&Frame> {
     scene.tiles.iter().chain(&scene.cards).find(|f| f.pane == pane)
@@ -915,6 +1004,12 @@ fn clipboard_text() -> Option<String> {
     // SAFETY: reading an AppKit constant that is set before `main` runs.
     let kind = unsafe { NSPasteboardTypeString };
     NSPasteboard::generalPasteboard().stringForType(kind).map(|s| s.to_string())
+}
+
+/// Whether macOS's Reduce Motion setting is on; layout changes then skip their springs
+/// (ADR 10). @see https://developer.apple.com/documentation/appkit/nsworkspace/accessibilitydisplayshouldreducemotion
+fn reduce_motion() -> bool {
+    objc2_app_kit::NSWorkspace::sharedWorkspace().accessibilityDisplayShouldReduceMotion()
 }
 
 fn enable_ime(window: &dyn Window) {

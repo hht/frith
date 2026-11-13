@@ -12,7 +12,7 @@
 use frith_core::colors::{Chrome, Tint};
 use frith_core::config::Rgb;
 use frith_core::geom::{Point, Rect};
-use frith_core::layout::{Divider, Drop, Edge, PaneId};
+use frith_core::layout::{Divider, Drop, Edge};
 use frith_core::scene::{ChromeButton, Frame, Guides, Hit, PaneButton, Scene};
 use skia_safe::{
     BlendMode, Canvas, ClipOp, Color, Font, GlyphId, MaskFilter, Paint, PaintStyle, RRect, Rect as SkRect,
@@ -139,26 +139,32 @@ pub fn empty_state(pen: &mut Pen, area: Rect) {
 }
 
 /// Card radius in physical pixels.
-fn radius(scale: f32) -> f32 {
+pub fn radius(scale: f32) -> f32 {
     10.0 * scale
 }
 
-/// The card's shadow, then a clip to its rounded frame for the grid and header; pair with
-/// `card_over`.
-pub fn card_under(pen: &Pen, f: &Frame) {
-    let c = pen.chrome;
-    let (canvas, scale) = (pen.canvas, pen.scale);
-    let rr = RRect::new_rect_xy(sk(f.outer), radius(scale), radius(scale));
+/// The shadow under a card whose whole rect is `outer` with corners of radius `corner`, at
+/// `alpha` (0 to 1) of its strength.
+pub fn card_shadow(pen: &Pen, outer: Rect, corner: f32, alpha: f32) {
+    let (c, scale) = (pen.chrome, pen.scale);
+    let rr = RRect::new_rect_xy(sk(outer), corner, corner);
     let mut p = Paint::default();
-    p.set_anti_alias(true).set_color(tint(c.shadow));
+    p.set_anti_alias(true).set_color(tint(Tint { alpha: (c.shadow.alpha as f32 * alpha).round() as u8, ..c.shadow }));
     p.set_mask_filter(MaskFilter::blur(skia_safe::BlurStyle::Normal, 12.0 * scale, false));
-    canvas.draw_rrect(rr.with_offset((0.0, 6.0 * scale)), &p);
-    canvas.save();
-    canvas.clip_rrect(rr, ClipOp::Intersect, true);
+    pen.canvas.draw_rrect(rr.with_offset((0.0, 6.0 * scale)), &p);
 }
 
-/// The card's header, the end of its clip, and its border; the focused card's is the accent.
-pub fn card_over(pen: &mut Pen, f: &Frame, look: &PaneLook, hover: Hit) {
+/// A clip to the card's frame, with corners of radius `corner`, for its grid and header; pair
+/// with `card_over`.
+pub fn card_clip(pen: &Pen, f: &Frame, corner: f32) {
+    let rr = RRect::new_rect_xy(sk(f.outer), corner, corner);
+    pen.canvas.save();
+    pen.canvas.clip_rrect(rr, ClipOp::Intersect, true);
+}
+
+/// The card's header, the end of its clip, and its border, with corners of radius `corner`, at
+/// `border` (0 to 1) of its strength; the focused card's is the accent.
+pub fn card_over(pen: &mut Pen, f: &Frame, look: &PaneLook, hover: Hit, corner: f32, border: f32) {
     let c = pen.chrome;
     let (canvas, scale) = (pen.canvas, pen.scale);
     let mut p = Paint::default();
@@ -166,9 +172,10 @@ pub fn card_over(pen: &mut Pen, f: &Frame, look: &PaneLook, hover: Hit) {
     canvas.draw_rect(sk(f.header), &p);
     header_content(pen, f, look, hover, true);
     canvas.restore();
-    let rr = RRect::new_rect_xy(sk(f.outer), radius(scale), radius(scale));
-    let border = if look.focused { col(c.accent) } else { tint(c.card_border) };
-    canvas.draw_rrect(rr, &stroke(border, scale));
+    let rr = RRect::new_rect_xy(sk(f.outer), corner, corner);
+    let color = if look.focused { col(c.accent) } else { tint(c.card_border) };
+    let alpha = (color.a() as f32 * border).round() as u8;
+    canvas.draw_rrect(rr, &stroke(color.with_a(alpha), scale));
 }
 
 /// Attention dot, title, and (when `buttons`) the header buttons.
@@ -265,26 +272,23 @@ fn icon(canvas: &Canvas, b: PaneButton, r: Rect, zoomed: bool, ink: Color, scale
     }
 }
 
-/// The dock bar's chips: one per minimized pane, with its title and attention dot.
-pub fn dock(pen: &mut Pen, scene: &Scene, look: impl Fn(PaneId) -> (String, bool), hover: Hit) {
+/// A minimized pane's chip in the dock bar, with its title and attention dot.
+pub fn chip(pen: &mut Pen, r: Rect, title: &str, attention: bool, hovered: bool) {
     let c = pen.chrome;
     let (canvas, scale) = (pen.canvas, pen.scale);
     let mut p = Paint::default();
     p.set_anti_alias(true);
-    for &(pane, r) in &scene.chips {
-        let (title, attention) = look(pane);
-        let rad = r.h / 2.0;
-        p.set_color(if hover == Hit::Chip(pane) { tint(c.hover) } else { tint(c.chip) });
-        canvas.draw_round_rect(sk(r), rad, rad, &p);
-        let mut x = r.x + rad;
-        if attention {
-            let d = 3.0 * scale;
-            p.set_color(col(c.attention));
-            canvas.draw_circle((x + d, r.y + r.h / 2.0), d, &p);
-            x += d * 3.0;
-        }
-        ui_text(pen, &title, x, r, r.right() - rad - x, col(c.text));
+    let rad = r.h / 2.0;
+    p.set_color(if hovered { tint(c.hover) } else { tint(c.chip) });
+    canvas.draw_round_rect(sk(r), rad, rad, &p);
+    let mut x = r.x + rad;
+    if attention {
+        let d = 3.0 * scale;
+        p.set_color(col(c.attention));
+        canvas.draw_circle((x + d, r.y + r.h / 2.0), d, &p);
+        x += d * 3.0;
     }
+    ui_text(pen, title, x, r, r.right() - rad - x, col(c.text));
 }
 
 /// Dock guides during a pane drag (ADR 6): the target tile's outline, where the pane will
