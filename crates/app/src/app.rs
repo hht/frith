@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 
 use frith_core::colors::{Chrome, Tint};
 use frith_core::config::{Config, Rgb};
+use frith_core::flare::Look;
 use frith_core::geom::{Point, Rect};
 use frith_core::gesture::{Effect, Gesture};
 use frith_core::layout::{Axis, Drop, Edge, Layout, PaneId};
@@ -35,6 +36,7 @@ use winit::window::{
 };
 
 use crate::atlas::Atlas;
+use crate::flare::{Flares, Kindle, Layer};
 use crate::fonts::{self, Fonts};
 use crate::gpu::Gpu;
 use crate::grid::Grid;
@@ -132,6 +134,8 @@ pub struct App {
     placed_revision: u64,
     /// Where each morphing pane's morph began.
     origins: HashMap<PaneId, Origin>,
+    /// Panes opening or closing (ADR 10).
+    flares: Flares,
     /// `layout.revision()` when the current gesture began; a structural change since then
     /// makes the panes and divider indices it captured stale.
     gesture_revision: u64,
@@ -171,6 +175,7 @@ impl App {
             gesture_revision: 0,
             placed: Vec::new(),
             origins: HashMap::new(),
+            flares: Flares::new(),
             placed_revision: 0,
             drag: None,
             resizing: None,
@@ -297,6 +302,9 @@ impl App {
             Ok(session) => {
                 let pane_state = Pane { session, grid: Grid::new(), title, attention: false };
                 self.panes.insert(pane, pane_state);
+                if !self.config.pane_open_duration.is_zero() {
+                    self.flares.open(pane);
+                }
                 self.focus(pane);
             }
             Err(e) => {
@@ -353,11 +361,17 @@ impl App {
         if self.drag.as_ref().is_some_and(|d| d.pane == pane) {
             self.drag = None;
         }
-        self.panes.remove(&pane);
+        let closed = self.panes.remove(&pane);
         let next = self.layout.remove(pane);
         if self.panes.is_empty() {
             el.exit();
             return;
+        }
+        // Kept for the next frame to capture as it fades, unless no frame will come soon: the
+        // pane's program ends when it is dropped.
+        let shown = self.win.as_ref().is_some_and(|w| !w.hidden());
+        if let Some(p) = closed.filter(|_| shown && !self.config.pane_close_duration.is_zero()) {
+            self.flares.close(pane, p, self.focus == Some(pane));
         }
         self.refocus(next);
         self.redraw();
@@ -424,6 +438,13 @@ impl App {
         due
     }
 
+    /// How flares that start this frame run, `still` under Reduce Motion (ADR 10).
+    fn kindle(&self, still: bool) -> Kindle {
+        let c = &self.config;
+        let (open, close, px) = (c.pane_open_duration, c.pane_close_duration, self.win().scale);
+        Kindle { open, close, look: look(still, c.pane_particles), px }
+    }
+
     fn draw(&mut self) {
         let scene = self.scene();
         let frame_due = self.resize_sessions(&scene);
@@ -435,12 +456,15 @@ impl App {
         // Only structural changes morph; dragged dividers and cards, and window resizes, keep
         // the revision and follow the pointer at once (ADR 10).
         let placed = placed(&scene);
+        let still = reduce_motion();
         // With panes not moving, a change captures nothing to morph from either.
-        let animate = !self.config.pane_move_duration.is_zero() && !reduce_motion();
+        let animate = !self.config.pane_move_duration.is_zero() && !still;
         let changed = self.layout.revision() != self.placed_revision && animate;
+        let kindle = self.kindle(still);
         let revision = std::mem::replace(&mut self.placed_revision, self.layout.revision());
         let before = std::mem::replace(&mut self.placed, placed.clone());
-        let App { win, panes, layout, focus, hover, pointer, preedit, chrome, fade, motion, origins, .. } = self;
+        let App { win, panes, layout, focus, hover, pointer, preedit, chrome, fade, motion, origins, flares, .. } =
+            self;
         let fade = fade.filter(|_| scene.tiles.len() + scene.cards.len() > 1);
         let (layout, focus, hover, pointer) = (&*layout, *focus, *hover, *pointer);
         let w = win.as_mut().expect("window");
@@ -466,6 +490,7 @@ impl App {
                 frame_due: None,
                 cursor: None,
             };
+            flares.start(&mut stage, &mut pen, ctx, &kindle, (&before, &placed), motion);
             if changed {
                 begin_morphs(&mut stage, &mut pen, ctx, (motion, origins), (&before, &placed), now);
             }
@@ -473,6 +498,7 @@ impl App {
             origins.retain(|p, _| motion.moving(*p, now));
             let (motion, origins) = (&*motion, &*origins);
             let morph = |pane, target| motion.morph(pane, target, now).map(|(r, p)| (r, p, origins.get(&pane)));
+            moving |= flares.track(&scene, |pane, target| motion.rect(pane, target, now), now);
             render::background(&pen, &scene);
             // Tiles a zoom just hid stay under the zoomed one growing over them; then tiles at
             // rest, so a moving tile uncovers what it makes room for (a new split).
@@ -484,14 +510,16 @@ impl App {
             let (resting, morphing): (Vec<_>, Vec<_>) =
                 scene.tiles.iter().partition(|f| morph(f.pane, f.outer).is_none());
             for f in resting.iter().chain(&morphing) {
-                stage.show(&mut pen, ctx, f.pane, Kind::Tile, f.outer, morph(f.pane, f.outer));
+                flares.show(&mut stage, &mut pen, ctx, (f.pane, Kind::Tile, f.outer), morph(f.pane, f.outer));
             }
             // Dividers sit where tiles end up; while tiles move, the gaps show instead.
             if !tiles_moving && morphing.is_empty() {
                 render::dividers(&pen, &scene.dividers, lit);
             }
+            flares.paint(&pen, Layer::Tiles, now);
             for f in &scene.cards {
-                stage.show(&mut pen, ctx, f.pane, Kind::Card, f.outer, morph(f.pane, f.outer));
+                flares.show(&mut stage, &mut pen, ctx, (f.pane, Kind::Card, f.outer), morph(f.pane, f.outer));
+                flares.paint(&pen, Layer::Over(f.pane), now);
             }
             if scene.tiles.is_empty() {
                 render::empty_state(&mut pen, scene.area);
@@ -960,6 +988,15 @@ fn begin_morphs(
     motion.retarget(&rects(before), &rects(placed), now);
 }
 
+/// How much of the spirit light shows (ADR 10): only a fade under Reduce Motion.
+fn look(reduce_motion: bool, particles: bool) -> Look {
+    match (reduce_motion, particles) {
+        (true, _) => Look::Still,
+        (false, true) => Look::Full,
+        (false, false) => Look::Plain,
+    }
+}
+
 fn rects(placed: &[Placed]) -> Vec<(PaneId, Rect)> {
     placed.iter().map(|&(p, r, _)| (p, r)).collect()
 }
@@ -1079,7 +1116,9 @@ impl ApplicationHandler for App {
                 // A pending screenshot still draws, so scripted runs get it while hidden.
                 let w = self.win.as_mut().expect("window");
                 w.missed = w.hidden() && self.shot.is_none();
-                if !w.missed {
+                if w.missed {
+                    self.flares.forget_closed();
+                } else {
                     self.draw();
                 }
             }

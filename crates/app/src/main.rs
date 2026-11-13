@@ -16,6 +16,7 @@
 mod app;
 mod atlas;
 mod config_files;
+mod flare;
 mod fonts;
 mod gpu;
 mod grid;

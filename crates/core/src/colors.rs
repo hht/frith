@@ -45,6 +45,8 @@ pub struct Chrome {
     pub card_border: Tint,
     pub shadow: Tint,
     pub preview: Tint,
+    /// The background is the brighter of the terminal's two colors.
+    pub light: bool,
 }
 
 const BLACK: Rgb = Rgb { r: 0, g: 0, b: 0 };
@@ -111,6 +113,7 @@ impl Chrome {
             card_border: Tint { rgb: text, alpha: 46 },
             shadow: Tint { rgb: BLACK, alpha: if light { 60 } else { 150 } },
             preview: Tint { rgb: accent, alpha: 64 },
+            light,
         }
     }
 }
@@ -295,5 +298,6 @@ mod tests {
         assert!(luminance(light.header) > 0.7 && luminance(dark.header) < 0.05);
         assert!(luminance(light.text) < luminance(light.header));
         assert!(light.shadow.alpha < dark.shadow.alpha, "a softer shadow on light chrome");
+        assert!(light.light && !dark.light, "light adds onto a dark theme only (ADR 10)");
     }
 }
