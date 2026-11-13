@@ -52,15 +52,13 @@ impl Gesture {
     /// Ends whatever gesture is active without completing it, for when the release will never
     /// come (the window lost focus): a pane drag is cancelled, a terminal gets its release.
     pub fn abort(&mut self) -> Effect {
-        let effect = match *self {
+        match std::mem::replace(self, Gesture::Idle) {
             Gesture::DraggingPane(p) => Effect::CancelDrag(p),
             Gesture::Terminal(p) => Effect::TerminalRelease(p),
             Gesture::Pressed { .. } | Gesture::ResizingCard(..) | Gesture::DraggingDivider(_) | Gesture::Idle => {
                 Effect::None
             }
-        };
-        *self = Gesture::Idle;
-        effect
+        }
     }
 
     /// A primary-button press; other buttons must not come here. Returns the effect that ends
@@ -117,10 +115,8 @@ impl Gesture {
             Gesture::Pressed { on: Hit::Chip(p), .. } => Effect::Restore(p),
             Gesture::Pressed { on: Hit::Chrome(b), .. } => Effect::Chrome(b),
             Gesture::DraggingPane(p) => Effect::Drop(p),
-            Gesture::Terminal(p) => Effect::TerminalRelease(p),
-            Gesture::Pressed { .. } | Gesture::ResizingCard(..) | Gesture::DraggingDivider(_) | Gesture::Idle => {
-                Effect::None
-            }
+            // A release that completes nothing ends the gesture as `abort` does.
+            _ => return self.abort(),
         };
         *self = Gesture::Idle;
         effect

@@ -195,10 +195,10 @@ fn padding(value: &str) -> Result<Padding, String> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
-    fn rgb(hex: u32) -> Rgb {
+    pub(crate) fn rgb(hex: u32) -> Rgb {
         Rgb { r: (hex >> 16) as u8, g: (hex >> 8) as u8, b: hex as u8 }
     }
 

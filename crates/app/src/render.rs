@@ -97,14 +97,12 @@ pub fn top_bar(pen: &Pen, scene: &Scene, hover: Hit) {
 /// A tile's header strip (the grid is drawn separately), with buttons only while the pane
 /// is focused or hovered.
 pub fn tile_header(pen: &mut Pen, f: &Frame, look: &PaneLook, hover: Hit) {
-    let c = pen.chrome;
-    let (canvas, scale) = (pen.canvas, pen.scale);
-    let mut p = Paint::default();
-    p.set_color(if look.focused { col(c.header_focused) } else { col(c.header) });
-    canvas.draw_rect(sk(f.header), &p);
+    header_fill(pen, f, look.focused);
     if look.focused {
-        p.set_color(col(c.accent));
-        canvas.draw_rect(SkRect::from_xywh(f.header.x, f.header.bottom() - scale, f.header.w, scale), &p);
+        let (h, scale) = (f.header, pen.scale);
+        let mut p = Paint::default();
+        p.set_color(col(pen.chrome.accent));
+        pen.canvas.draw_rect(SkRect::from_xywh(h.x, h.bottom() - scale, h.w, scale), &p);
     }
     header_content(pen, f, look, hover, look.focused || look.hovered);
 }
@@ -165,17 +163,22 @@ pub fn card_clip(pen: &Pen, f: &Frame, corner: f32) {
 /// The card's header, the end of its clip, and its border, with corners of radius `corner`, at
 /// `border` (0 to 1) of its strength; the focused card's is the accent.
 pub fn card_over(pen: &mut Pen, f: &Frame, look: &PaneLook, hover: Hit, corner: f32, border: f32) {
-    let c = pen.chrome;
-    let (canvas, scale) = (pen.canvas, pen.scale);
-    let mut p = Paint::default();
-    p.set_color(if look.focused { col(c.header_focused) } else { col(c.header) });
-    canvas.draw_rect(sk(f.header), &p);
+    header_fill(pen, f, look.focused);
     header_content(pen, f, look, hover, true);
+    let (c, canvas, scale) = (pen.chrome, pen.canvas, pen.scale);
     canvas.restore();
     let rr = RRect::new_rect_xy(sk(f.outer), corner, corner);
     let color = if look.focused { col(c.accent) } else { tint(c.card_border) };
     let alpha = (color.a() as f32 * border).round() as u8;
     canvas.draw_rrect(rr, &stroke(color.with_a(alpha), scale));
+}
+
+/// The header strip's background, in the focused shade when `focused`.
+fn header_fill(pen: &Pen, f: &Frame, focused: bool) {
+    let c = pen.chrome;
+    let mut p = Paint::default();
+    p.set_color(if focused { col(c.header_focused) } else { col(c.header) });
+    pen.canvas.draw_rect(sk(f.header), &p);
 }
 
 /// Attention dot, title, and (when `buttons`) the header buttons.

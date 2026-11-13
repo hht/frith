@@ -912,6 +912,18 @@ mod tests {
         }
     }
 
+    /// The prompt after `echo $((6*7))` is drawn: its `top` line is the second on screen.
+    fn at_second_prompt(t: &str) -> bool {
+        t.matches("top").count() == 2 && t.trim_end().ends_with('>')
+    }
+
+    /// No resize duplicated or lost a prompt or the command's output.
+    #[track_caller]
+    fn assert_two_prompts_and_one_answer(s: &Session) {
+        let t = s.screen_text();
+        assert_eq!((t.matches("top").count(), t.matches("\n42").count()), (2, 1), "{t:?}");
+    }
+
     /// Resizes to each width in turn, letting zsh redraw after each.
     fn resize_through(s: &mut Session, widths: &[u32]) {
         for &w in widths {
@@ -956,10 +968,9 @@ precmd_functions+=(_like_p10k)
         let mut s = zsh_in("like-p10k", true, "", p10k);
         // After a command, only the marks on the new prompt tell where it starts.
         s.write(b"echo $((6*7))\r");
-        settle_until(&mut s, |t| t.matches("top").count() == 2 && t.trim_end().ends_with('>'));
+        settle_until(&mut s, at_second_prompt);
         resize_through(&mut s, &[60, 80, 50, 80]);
-        let t = s.screen_text();
-        assert_eq!((t.matches("top").count(), t.matches("\n42").count()), (2, 1), "{t:?}");
+        assert_two_prompts_and_one_answer(&s);
     }
 
     #[test]
@@ -969,10 +980,9 @@ precmd_functions+=(_like_p10k)
         s.write(b"echo $((6*7)); sleep 0.5\r");
         settle_until(&mut s, |t| t.contains("\n42"));
         resize_through(&mut s, &[60, 80]);
-        settle_until(&mut s, |t| t.matches("top").count() == 2 && t.trim_end().ends_with('>'));
+        settle_until(&mut s, at_second_prompt);
         resize_through(&mut s, &[50, 80]);
-        let t = s.screen_text();
-        assert_eq!((t.matches("top").count(), t.matches("\n42").count()), (2, 1), "{t:?}");
+        assert_two_prompts_and_one_answer(&s);
     }
 
     #[test]

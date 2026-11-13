@@ -166,10 +166,7 @@ pub fn contrast(a: Rgb, b: Rgb) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn rgb(hex: u32) -> Rgb {
-        Rgb { r: (hex >> 16) as u8, g: (hex >> 8) as u8, b: hex as u8 }
-    }
+    use crate::config::tests::rgb;
 
     /// (name, background, foreground, palette 4, palette 3)
     const THEMES: [(&str, u32, u32, u32, u32); 10] = [
