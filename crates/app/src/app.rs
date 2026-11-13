@@ -1121,12 +1121,12 @@ impl ApplicationHandler for App {
     }
 }
 
-/// The chrome for the configured terminal colors. Palette 4 (blue) is the accent and 3
-/// (yellow) the attention color, at libghostty-vt's defaults unless configured.
+/// The chrome for the configured colors. Palette 3 (yellow) is the attention color, at
+/// libghostty-vt's default unless configured.
 /// @see Ghostty `src/terminal/color.zig` (`Name.default`)
 fn chrome_for(config: &Config) -> Chrome {
-    let entry = |i: u8, r: u8, g: u8, b: u8| config.palette.get(&i).copied().unwrap_or(Rgb { r, g, b });
-    Chrome::derive(config.background, config.foreground, entry(4, 0x81, 0xa2, 0xbe), entry(3, 0xf0, 0xc6, 0x74))
+    let attention = config.palette.get(&3).copied().unwrap_or(Rgb { r: 0xf0, g: 0xc6, b: 0x74 });
+    Chrome::derive(config.background, config.foreground, config.accent, attention)
 }
 
 /// The fade over unfocused panes: their content shows through at

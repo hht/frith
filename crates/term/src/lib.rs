@@ -737,12 +737,12 @@ mod tests {
     }
 
     #[test]
-    fn without_a_config_the_terminal_reports_ghosttys_default_colors() {
+    fn without_a_config_the_terminal_reports_friths_default_colors() {
         let line = "stty raw -echo min 0 time 5; printf '\\033]10;?\\a\\033]11;?\\a'; \
                     r=$(cat); stty sane; printf '%s' \"$r\" | tr '\\007' '\\n' | cat -v; echo end";
         let s = started(line, "end");
         let text = s.screen_text();
-        for want in ["]10;rgb:ffff/ffff/ffff", "]11;rgb:2828/2c2c/3434"] {
+        for want in ["]10;rgb:eeee/eeee/e6e6", "]11;rgb:0a0a/0a0a/0a0a"] {
             assert!(text.contains(want), "no {want:?} in {text:?}");
         }
     }

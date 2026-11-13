@@ -1,13 +1,13 @@
-//! The chrome's colors, derived from the terminal's own (ADR 14), so the window and its
-//! panes read as one surface under any theme.
+//! The chrome's colors, derived from the terminal's own and the configured accent (ADR 14),
+//! so the window and its panes read as one surface under any theme.
 //!
-//! Answers: what color is each piece of chrome, given the terminal's colors?
+//! Answers: what color is each piece of chrome, given the terminal's colors and the accent?
 //! Must not know: how or where chrome is painted, fonts, or terminals.
 //!
 //! Surfaces stay a few steps from the terminal background: the bars recede (darker), headers
 //! lift toward the foreground. Text keeps at least 4.5:1 contrast on every surface it sits on
 //! (WCAG 1.4.3) and the accent at least 3:1 (WCAG 1.4.11), moving toward black or white
-//! where the theme's own colors fall short.
+//! where the given colors fall short.
 //! @see https://www.w3.org/TR/WCAG22/#contrast-minimum
 //! @see https://www.w3.org/TR/WCAG22/#non-text-contrast
 
@@ -51,7 +51,7 @@ const BLACK: Rgb = Rgb { r: 0, g: 0, b: 0 };
 const WHITE: Rgb = Rgb { r: 255, g: 255, b: 255 };
 
 impl Chrome {
-    /// The chrome for a terminal drawn in `fg` on `bg`, with `accent` (palette 4, blue) and
+    /// The chrome for a terminal drawn in `fg` on `bg`, with the configured `accent` and
     /// `attention` (palette 3, yellow) from its palette.
     pub fn derive(bg: Rgb, fg: Rgb, accent: Rgb, attention: Rgb) -> Chrome {
         // A light theme has the brighter background; equal ones count as dark.
@@ -168,8 +168,10 @@ mod tests {
     use super::*;
     use crate::config::tests::rgb;
 
-    /// (name, background, foreground, palette 4, palette 3)
-    const THEMES: [(&str, u32, u32, u32, u32); 10] = [
+    /// (name, background, foreground, accent, palette 3); themes other than Frith's take
+    /// their palette 4 as the accent, as a user matching one would.
+    const THEMES: [(&str, u32, u32, u32, u32); 11] = [
+        ("Frith's defaults", 0x0a0a0a, 0xeeeee6, 0xf6763e, 0xf0c674),
         ("the user's One Dark", 0x21252b, 0xabb2bf, 0x61afef, 0xe5c07b),
         ("Ghostty's defaults", 0x282c34, 0xffffff, 0x81a2be, 0xf0c674),
         ("One Light", 0xfafafa, 0x383a42, 0x4078f2, 0xc18401),
@@ -181,10 +183,6 @@ mod tests {
         ("black on mid gray", 0x777777, 0x000000, 0x0000aa, 0xaaaa00),
         ("white on mid gray", 0x767676, 0xffffff, 0x0000aa, 0xaaaa00),
     ];
-
-    fn each(f: impl Fn(&str, Rgb, Chrome)) {
-        each_with_fg(|name, bg, _, c| f(name, bg, c));
-    }
 
     fn each_with_fg(f: impl Fn(&str, Rgb, Rgb, Chrome)) {
         for (name, bg, fg, accent, attention) in THEMES {
@@ -240,8 +238,14 @@ mod tests {
     }
 
     #[test]
-    fn the_accent_stands_out_wherever_it_is_drawn_and_keeps_the_themes_hue_where_it_can() {
-        each(|name, bg, c| {
+    fn the_accent_stands_out_wherever_it_is_drawn_and_keeps_the_configured_hue_where_it_can() {
+        let orange = rgb(0xf6763e);
+        // Each theme with its own accent, as a user matching it would set, and with the default.
+        let cases = THEMES.iter().flat_map(|&(name, bg, fg, accent, attention)| {
+            [(name, rgb(accent)), (name, orange)]
+                .map(|(name, a)| (name, rgb(bg), Chrome::derive(rgb(bg), rgb(fg), a, rgb(attention))))
+        });
+        for (name, bg, c) in cases {
             // Focus lines and borders, the cursor, lit dividers, drop outlines, guide icons.
             for (on, s) in [
                 ("header", c.header),
@@ -253,9 +257,11 @@ mod tests {
                 let r = contrast(c.accent, s);
                 assert!(r >= 3.0, "{name}: accent on the {on} is {r:.2}:1");
             }
-        });
+        }
         let c = Chrome::derive(rgb(0x21252b), rgb(0xabb2bf), rgb(0x61afef), rgb(0xe5c07b));
         assert_eq!(c.accent, rgb(0x61afef), "already legible: unchanged");
+        let c = Chrome::derive(rgb(0x0a0a0a), rgb(0xeeeee6), orange, rgb(0xf0c674));
+        assert_eq!(c.accent, orange, "Frith's defaults show the accent as configured");
     }
 
     #[test]

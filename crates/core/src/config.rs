@@ -34,6 +34,8 @@ pub struct Config {
     pub foreground: Rgb,
     /// `None` draws the cursor in the chrome's accent.
     pub cursor_color: Option<Rgb>,
+    /// The chrome's accent: focus, guides, the cursor by default. Frith's own key (ADR 14).
+    pub accent: Rgb,
     /// Palette entries the user set; the others keep the terminal's defaults.
     pub palette: BTreeMap<u8, Rgb>,
     pub padding_x: Padding,
@@ -44,17 +46,19 @@ pub struct Config {
     pub unfocused_split_fill: Option<Rgb>,
 }
 
-/// Ghostty's defaults, so a Ghostty config that leaves a key out looks the same in Frith.
-/// @see Ghostty `src/config/Config.zig` (`font-size`, `background`, `foreground`,
-/// `window-padding-x`, `window-padding-y`, `unfocused-split-opacity`, `unfocused-split-fill`)
+/// Ghostty's defaults, so a Ghostty config that leaves a key out looks the same in Frith,
+/// except `background` and `foreground`, which are Frith's own, as is the `accent` key (ADR 14).
+/// @see Ghostty `src/config/Config.zig` (`font-size`, `window-padding-x`, `window-padding-y`,
+/// `unfocused-split-opacity`, `unfocused-split-fill`)
 impl Default for Config {
     fn default() -> Config {
         Config {
             font_family: Vec::new(),
             font_size: 13.0,
-            background: Rgb { r: 0x28, g: 0x2c, b: 0x34 },
-            foreground: Rgb { r: 0xff, g: 0xff, b: 0xff },
+            background: Rgb { r: 0x0a, g: 0x0a, b: 0x0a },
+            foreground: Rgb { r: 0xee, g: 0xee, b: 0xe6 },
             cursor_color: None,
+            accent: Rgb { r: 0xf6, g: 0x76, b: 0x3e },
             palette: BTreeMap::new(),
             padding_x: Padding { start: 2.0, end: 2.0 },
             padding_y: Padding { start: 2.0, end: 2.0 },
@@ -118,6 +122,7 @@ impl Config {
             "background" => self.background = if empty { d.background } else { color(value)? },
             "foreground" => self.foreground = if empty { d.foreground } else { color(value)? },
             "cursor-color" => self.cursor_color = if empty { d.cursor_color } else { Some(color(value)?) },
+            "accent" => self.accent = if empty { d.accent } else { color(value)? },
             "palette" if empty => self.palette = d.palette,
             "palette" => {
                 let (i, c) = palette_entry(value)?;
@@ -274,12 +279,12 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn defaults_and_limits_follow_ghostty() {
+    fn defaults_and_limits_follow_ghostty_but_the_colors_are_friths() {
         let d = Config::default();
         assert_eq!((d.font_size, d.padding_x, d.padding_y), (13.0, Padding { start: 2.0, end: 2.0 }, d.padding_x));
         // Without these the terminal draws black: libghostty-vt leaves the defaults to its
-        // caller (src/terminal/render.zig, `bg_fg`).
-        assert_eq!((d.background, d.foreground), (rgb(0x282c34), rgb(0xffffff)));
+        // caller (src/terminal/render.zig, `bg_fg`). Frith's own, not Ghostty's (ADR 14).
+        assert_eq!((d.background, d.foreground), (rgb(0x0a0a0a), rgb(0xeeeee6)));
         let mut c = Config::default();
         c.read("background = #000\nforeground = #000\nbackground =\nforeground =\n");
         assert_eq!((c.background, c.foreground), (d.background, d.foreground), "an empty value restores them");
@@ -306,6 +311,17 @@ pub(crate) mod tests {
         let notes = c.read("unfocused-split-opacity = dim\nunfocused-split-opacity =\nunfocused-split-fill =\n");
         assert_eq!(notes.errors.len(), 1, "{notes:?}");
         assert_eq!((c.unfocused_split_opacity, c.unfocused_split_fill), (0.7, None), "empty restores the default");
+    }
+
+    #[test]
+    fn the_accent_is_friths_orange_unless_configured() {
+        let mut c = Config::default();
+        assert_eq!(c.accent, rgb(0xf6763e));
+        let notes = c.read("accent = #61afef\n");
+        assert_eq!(notes, Notes::default());
+        assert_eq!(c.accent, rgb(0x61afef));
+        c.read("accent =\n");
+        assert_eq!(c.accent, rgb(0xf6763e), "an empty value restores it");
     }
 
     #[test]
