@@ -76,7 +76,7 @@ impl Atlas {
             self.next = (0.0, self.next.1 + sh);
         }
         if self.next.1 + sh > SIDE as f32 {
-            // Spike problem 10: an LRU would evict only what is unused.
+            // An LRU would evict only what is unused.
             self.slots.clear();
             self.surface.canvas().clear(Color::TRANSPARENT);
             self.next = (0.0, 0.0);

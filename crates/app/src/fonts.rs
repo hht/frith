@@ -6,8 +6,8 @@
 //! Lookup order (ADR 5, as in Ghostty): the configured families that are installed, the
 //! bundled JetBrains Mono, the bundled Symbols Nerd Font, then the system's per-character
 //! fallback. LastResort is never used: it claims every code point with placeholder boxes, so
-//! once loaded it would shadow every later fallback (spike problem 9: braille showed as `?`
-//! after p10k icons were drawn).
+//! once loaded it would shadow every later fallback (braille showed as `?` after p10k icons
+//! were drawn).
 
 use std::collections::HashMap;
 

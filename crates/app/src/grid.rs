@@ -5,7 +5,7 @@
 //! Must not know: panes, chrome, layout, or window events; callers pass the content rect.
 //!
 //! Only dirty rows are re-read, so an idle pane redraws from its caches. No shaping yet: one
-//! glyph per cell (spike problem 4).
+//! glyph per cell.
 
 use libghostty_vt::color::Rgb;
 use libghostty_vt::render::{CellIterator, Dirty, RenderState, RowIterator};

@@ -6,7 +6,7 @@
 
 A desktop GPU terminal and multiplexer for running AI coding agents (Claude Code, Codex, Cursor Agent, …) side by side: macOS first, then Windows and Linux. Product goals: small binary, excellent performance, full TUI support, and a striking UI (in-window frosted-glass panes, custom shaders). Plugins run out of process over stdio JSON-RPC and contribute data only; the host draws all UI. The design is original: draw on the category, not on any one product's screens.
 
-The stack is under evaluation: Rust + winit + skia-safe (Ganesh) + libghostty-vt, pending the spike in `spike-skia-ghostty/`. Facts and risks: [research](docs/research/skia-libghostty-terminal.md).
+The stack is Rust + winit + skia-safe (Ganesh) + libghostty-vt (ADR 8). Facts and risks: [research](docs/research/skia-libghostty-terminal.md).
 
 ## Core principles
 
@@ -21,13 +21,6 @@ The stack is under evaluation: Rust + winit + skia-safe (Ganesh) + libghostty-vt
 
 Hold the product to four properties: TUIs behave exactly as in a reference terminal, input never waits on rendering or IO, the binary stays small, and idle panes cost nothing.
 
-## Layout
-
-```
-docs/research/        Research notes from the `research` skill, with sources
-spike-*/              Throwaway prototypes answering one question each; never imported by product code
-```
-
 ## Documentation
 
 Code and tests are the source of truth. Documentation records only user-approved decisions and rationale not visible from the code; record each approved architecture decision in `docs/adr.md` (create it with the first one) and ask the user before changing one. Write identifiers and code comments in simple English; write `docs/` in Chinese.
@@ -39,7 +32,7 @@ Adding a dependency or a tool requires explicit user approval.
 - Install tools with mise, pinned in the nearest `mise.toml`, and run builds through it (`mise exec -- cargo …`); use Homebrew only when the user approves.
 - libghostty-vt builds only with Zig 0.17.x; any other minor version fails the build.
 - mise installs that hit the GitHub API can fail with 403 from rate limiting; retry with `GITHUB_TOKEN=$(gh auth token)`.
-- A spike's run knobs live in the header comment of its `src/main.rs`.
+- Development knobs (env vars such as `FRITH_CMD` and `FRITH_SCRIPT` for scripted runs) live in the header comment of `crates/app/src/main.rs`.
 
 ## Commits
 
@@ -63,7 +56,7 @@ Adding a dependency or a tool requires explicit user approval.
 |---|---|---|
 | Refine designs and resolve open questions | `grilling` | `docs/adr.md` |
 | Research library or protocol facts | `research` | `docs/research/` |
-| Answer a design or performance question with throwaway code | `prototype` | `spike-<topic>/` |
+| Answer a design or performance question with throwaway code | `prototype` | `/tmp/<topic>/`, outside the repo |
 | Implement features | `tdd` (interface vocabulary in `codebase-design`) | Code and tests |
 | Diagnose hard bugs or slowness | `diagnosing-bugs` | Root cause in commit message |
 | Edit `CLAUDE.md` or skills | `writing-for-agents` | — |

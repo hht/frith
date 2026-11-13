@@ -25,7 +25,7 @@
 ## 5. 内置 JetBrains Mono 与 Nerd Font 图标字体，文字字体可由用户配置（2026-11-12，同日两次修订）
 
 决定：内置 JetBrains Mono 2.304 常规体可变字体（`JetBrainsMono[wght].ttf`，303,144 字节，OFL 1.1，粗体用 `wght` 700，暂不内置斜体）与 Symbols Nerd Font Mono（v3.5.1，`SymbolsNerdFontMono-Regular.ttf`，2,610,012 字节，只含图标）。字体回退顺序与 Ghostty 一致：用户配置的字体中已安装的 → JetBrains Mono → Nerd 图标字体 → 系统按字符回退；配置的字体都未安装时由 JetBrains Mono 决定格子大小。回退时跳过 LastResort。powerline（U+E0B0–E0BF）、框线、方块字形由程序自绘（暂缓）。
-理由：用户要求与 Ghostty 一致，Ghostty 内置同一字体并按此顺序回退（`src/font/SharedGridSet.zig`、`src/font/embedded.zig`）；内置文字字体也让 macOS、Windows、Linux 的默认外观一致，不依赖各系统自带字体。用约 0.3 MB 换一致性。未装 Nerd Font 的机器上 p10k 等提示符的图标会显示为 `?`（spike 问题 7），用户选择以约 2.6 MB 体积换开箱即用。
+理由：用户要求与 Ghostty 一致，Ghostty 内置同一字体并按此顺序回退（`src/font/SharedGridSet.zig`、`src/font/embedded.zig`）；内置文字字体也让 macOS、Windows、Linux 的默认外观一致，不依赖各系统自带字体。用约 0.3 MB 换一致性。未装 Nerd Font 的机器上 p10k 等提示符的图标会显示为 `?`，用户选择以约 2.6 MB 体积换开箱即用。
 修订前：第一次修订前不内置任何字体；第二次修订前只内置 Nerd 图标字体，文字字体不内置，配置的字体未安装时退回 Menlo。
 
 ## 6. 窗口 = 平铺层 + 浮动层，面板不离开根窗口（2026-11-12，同日修订）
@@ -51,7 +51,7 @@
 ## 8. UI 层用 winit + skia-safe（Ganesh），终端用 libghostty-vt（2026-11-12）
 
 决定：窗口与事件用 winit，绘制用 skia-safe 的 Ganesh 后端（macOS 上为 Metal），VT 解析与终端状态用 libghostty-vt；不用 GPUI。
-理由：spike 两个问题都答「可行」：吞吐贴近 PTY 上限，单帧绘制 p50 约 0.6 ms，四个空闲面板 CPU 0.0–0.1%，release 二进制约 5.5 MB，窗口内毛玻璃与多窗口拖出均已实现。见 [spike 结果](../spike-skia-ghostty/RESULTS.md)。
+理由：spike 两个问题都答「可行」：吞吐贴近 PTY 上限，单帧绘制 p50 约 0.6 ms，四个空闲面板 CPU 0.0–0.1%，release 二进制约 5.5 MB，窗口内毛玻璃与多窗口拖出均已实现。见 spike 结果：`git show 56e35dbe5e727f5015e43b232adeef6e07f72471:spike-skia-ghostty/RESULTS.md`（spike 已删除）。
 
 ## 9. v1 范围中的宿主界面（2026-11-12）
 

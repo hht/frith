@@ -1,5 +1,0 @@
-# PROTOTYPE spike — throwaway. Toolchain pins for the Skia + libghostty-vt spike.
-[tools]
-zig = "0.17.1"
-neovim = "latest"
-bottom = "latest"
