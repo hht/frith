@@ -48,11 +48,17 @@ pub struct Config {
     /// The duration of the spring panes move along when the arrangement changes; zero turns
     /// the morph off. Frith's own key (ADR 10).
     pub pane_move_duration: Duration,
+    /// How long an opening pane takes to come in, and a closing one to go (ADR 10); zero
+    /// shows or removes it at once.
+    pub pane_open_duration: Duration,
+    pub pane_close_duration: Duration,
+    /// Whether opening and closing panes glow and shed motes of light (ADR 10).
+    pub pane_particles: bool,
 }
 
 /// Ghostty's defaults, so a Ghostty config that leaves a key out looks the same in Frith,
 /// except `background` and `foreground`, which are Frith's own, as are the `accent` key (ADR 14)
-/// and `pane-move-duration` (ADR 10).
+/// and the pane animation keys (ADR 10).
 /// @see Ghostty `src/config/Config.zig` (`font-size`, `window-padding-x`, `window-padding-y`,
 /// `unfocused-split-opacity`, `unfocused-split-fill`)
 impl Default for Config {
@@ -70,6 +76,9 @@ impl Default for Config {
             unfocused_split_opacity: 0.7,
             unfocused_split_fill: None,
             pane_move_duration: Duration::from_millis(500),
+            pane_open_duration: Duration::from_millis(500),
+            pane_close_duration: Duration::from_millis(300),
+            pane_particles: true,
         }
     }
 }
@@ -144,6 +153,13 @@ impl Config {
             "pane-move-duration" => {
                 self.pane_move_duration = if empty { d.pane_move_duration } else { seconds(value)? }
             }
+            "pane-open-duration" => {
+                self.pane_open_duration = if empty { d.pane_open_duration } else { seconds(value)? }
+            }
+            "pane-close-duration" => {
+                self.pane_close_duration = if empty { d.pane_close_duration } else { seconds(value)? }
+            }
+            "pane-particles" => self.pane_particles = if empty { d.pane_particles } else { boolean(value)? },
             _ => return Ok(false),
         }
         Ok(true)
@@ -168,6 +184,15 @@ fn opacity(value: &str) -> Result<f32, String> {
 fn seconds(value: &str) -> Result<Duration, String> {
     let s = value.parse::<f64>().ok().filter(|s| s.is_finite() && *s >= 0.0);
     s.map(|s| Duration::from_secs_f64(s.min(10.0))).ok_or_else(|| format!("not a number of seconds: {value:?}"))
+}
+
+/// `true` or `false`, or Ghostty's short forms. @see Ghostty `src/cli/args.zig` (`parseBool`)
+fn boolean(value: &str) -> Result<bool, String> {
+    match value {
+        "1" | "t" | "T" | "true" => Ok(true),
+        "0" | "f" | "F" | "false" => Ok(false),
+        _ => Err(format!("not true or false: {value:?}")),
+    }
 }
 
 /// `#RRGGBB`, `RRGGBB`, `#RGB` or `RGB`. Ghostty also takes X11 names and `rgb:` forms.
@@ -356,6 +381,26 @@ pub(crate) mod tests {
         assert_eq!(c.pane_move_duration, Duration::ZERO, "a bad value keeps the earlier one");
         c.read("pane-move-duration =\n");
         assert_eq!(c.pane_move_duration, Duration::from_millis(500), "an empty value restores it");
+    }
+
+    #[test]
+    fn panes_open_in_half_a_second_and_close_in_a_third_with_particles_unless_configured() {
+        let mut c = Config::default();
+        let d = (c.pane_open_duration, c.pane_close_duration, c.pane_particles);
+        assert_eq!(d, (Duration::from_millis(500), Duration::from_millis(300), true));
+        let notes = c.read("pane-open-duration = 0\npane-close-duration = 30\npane-particles = false\n");
+        assert_eq!(notes, Notes::default());
+        let set = (c.pane_open_duration, c.pane_close_duration, c.pane_particles);
+        assert_eq!(set, (Duration::ZERO, Duration::from_secs(10), false), "clamped to 10 s");
+        let notes = c.read("pane-open-duration = -1\npane-particles = no\n");
+        assert_eq!(notes.errors.len(), 2, "{notes:?}");
+        assert_eq!((c.pane_open_duration, c.pane_particles), (Duration::ZERO, false), "kept");
+        for (v, on) in [("true", true), ("0", false), ("t", true), ("F", false), ("1", true)] {
+            c.read(&format!("pane-particles = {v}\n"));
+            assert_eq!(c.pane_particles, on, "{v}: Ghostty's spellings");
+        }
+        c.read("pane-open-duration =\npane-close-duration =\npane-particles =\n");
+        assert_eq!((c.pane_open_duration, c.pane_close_duration, c.pane_particles), d, "empty restores");
     }
 
     #[test]
