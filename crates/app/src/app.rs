@@ -40,7 +40,7 @@ use crate::gpu::Gpu;
 use crate::grid::Grid;
 use crate::render;
 use crate::screens::Screens;
-use crate::stage::{Kind, Origin, Pane, Stage};
+use crate::stage::{Kind, Origin, Pane, Placed, Stage};
 use crate::{Cfg, unescape};
 
 /// Upper bound on PTY bytes parsed per pane per wake-up, so one flooding pane cannot starve
@@ -128,7 +128,7 @@ pub struct App {
     motion: Motion,
     /// Each pane's rect and kind when last drawn, and `layout.revision()` then: a new
     /// revision morphs panes from these.
-    placed: Vec<(PaneId, Rect, Kind)>,
+    placed: Vec<Placed>,
     placed_revision: u64,
     /// Where each morphing pane's morph began.
     origins: HashMap<PaneId, Origin>,
@@ -467,18 +467,7 @@ impl App {
                 cursor: None,
             };
             if changed {
-                // Each pane about to move starts from the shape it shows now, mid-morph or
-                // not. One turning into or out of its chip, or already fading an image, also
-                // starts from an image of what is on screen; others draw live (see `stage`).
-                for &was @ (pane, from, _) in &before {
-                    let Some(&(_, to, next)) = placed.iter().find(|(p, ..)| *p == pane) else { continue };
-                    if to == from {
-                        continue;
-                    }
-                    let (old, shown) = (origins.remove(&pane), motion.morph(pane, from, now));
-                    origins.insert(pane, stage.origin(&mut pen, ctx, was, next, shown, old));
-                }
-                motion.retarget(&rects(&before), &rects(&placed), now);
+                begin_morphs(&mut stage, &mut pen, ctx, (motion, origins), (&before, &placed), now);
             }
             moving = motion.settle(now);
             origins.retain(|p, _| motion.moving(*p, now));
@@ -942,13 +931,36 @@ impl App {
 }
 
 /// Where each pane sits and what it shows as: tiles, cards, then dock chips.
-fn placed(scene: &Scene) -> Vec<(PaneId, Rect, Kind)> {
+fn placed(scene: &Scene) -> Vec<Placed> {
     let tiles = scene.tiles.iter().map(|f| (f.pane, f.outer, Kind::Tile));
     let cards = scene.cards.iter().map(|f| (f.pane, f.outer, Kind::Card));
     tiles.chain(cards).chain(scene.chips.iter().map(|&(p, r)| (p, r, Kind::Chip))).collect()
 }
 
-fn rects(placed: &[(PaneId, Rect, Kind)]) -> Vec<(PaneId, Rect)> {
+/// Starts the morphs of panes whose rects changed from `before` to `placed`. Each starts from
+/// the shape it shows now, mid-morph or not; one turning into or out of its chip, or already
+/// fading an image, also starts from an image of what is on screen; others draw live (see
+/// `stage`).
+fn begin_morphs(
+    stage: &mut Stage,
+    pen: &mut render::Pen,
+    ctx: &mut skia_safe::gpu::DirectContext,
+    (motion, origins): (&mut Motion, &mut HashMap<PaneId, Origin>),
+    (before, placed): (&[Placed], &[Placed]),
+    now: Instant,
+) {
+    for &was @ (pane, from, _) in before {
+        let Some(&(_, to, next)) = placed.iter().find(|(p, ..)| *p == pane) else { continue };
+        if to == from {
+            continue;
+        }
+        let (old, shown) = (origins.remove(&pane), motion.morph(pane, from, now));
+        origins.insert(pane, stage.origin(pen, ctx, was, next, shown, old));
+    }
+    motion.retarget(&rects(before), &rects(placed), now);
+}
+
+fn rects(placed: &[Placed]) -> Vec<(PaneId, Rect)> {
     placed.iter().map(|&(p, r, _)| (p, r)).collect()
 }
 

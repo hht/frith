@@ -48,6 +48,9 @@ pub enum Kind {
     Chip,
 }
 
+/// A pane as placed in a frame: its id, whole rect, and what it shows as.
+pub type Placed = (PaneId, Rect, Kind);
+
 /// The shape of a pane's frame: what it shows as, its corner radius, and how much of a card
 /// it looks, 0 to 1 (its shadow's and border's strength).
 #[derive(Clone, Copy, PartialEq, Debug)]
