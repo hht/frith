@@ -38,6 +38,7 @@ Adding a dependency or a tool requires explicit user approval.
 
 - Follow Conventional Commits in English, types `feat` `fix` `change` `refactor` `test` `docs` `deps` `chore`, no scope.
 - Each commit makes one self-contained change with its tests; keep refactoring separate from features and fixes.
+- Every commit passes `mise run check`, the gates defined in `mise.toml`; the git pre-commit hook runs it on the whole working tree, so a commit split from a larger tree must also pass alone. A function past clippy's size or complexity limit is split by question, or carries `#[expect(..., reason = "...")]`.
 - Before committing, review the diff line by line, deletion first, and report what was deleted, changed, and kept with justification; then dispatch a fresh read-only subagent (not a fork) to review the diff for regressions and bugs, citing `file:line` or a reproduction for each finding.
 
 ## Reporting

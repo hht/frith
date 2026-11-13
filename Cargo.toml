@@ -11,6 +11,10 @@ unsafe_op_in_unsafe_fn = "deny"
 
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }
+# Function limits at clippy's defaults (100 lines, cognitive complexity 25); `mise run check`
+# turns warnings into errors.
+too_many_lines = "warn"
+cognitive_complexity = "warn"
 
 [profile.release]
 strip = true

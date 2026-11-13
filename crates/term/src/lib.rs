@@ -543,6 +543,7 @@ fn to_mods(m: ModifiersState) -> key::Mods {
 }
 
 /// winit physical key -> ghostty key. Both follow W3C UI Events `code` names.
+#[expect(clippy::too_many_lines, reason = "a table: one arm per key code")]
 fn map_key(code: KeyCode) -> Option<Key> {
     use KeyCode as K;
     Some(match code {

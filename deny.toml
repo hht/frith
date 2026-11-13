@@ -1,0 +1,28 @@
+# cargo-deny settings. `mise run check` gates commits on duplicate crate versions, licenses,
+# and where crates come from; `mise run audit` checks security advisories.
+# @see https://embarkstudios.github.io/cargo-deny/checks/cfg.html
+
+# Only the platforms we ship: crates for other platforms never reach a binary. Add Windows
+# and Linux here when they ship.
+[graph]
+targets = ["aarch64-apple-darwin", "x86_64-apple-darwin"]
+
+[licenses]
+allow = [
+    "Apache-2.0",
+    "BSD-3-Clause",
+    "ISC",
+    "MIT",
+    "Unicode-3.0",
+    "Zlib",
+]
+# Our own crates are never published (`publish = false`).
+private = { ignore = true }
+
+[bans]
+multiple-versions = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-git = ["https://github.com/Uzaaft/libghostty-rs"]

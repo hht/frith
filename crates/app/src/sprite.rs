@@ -141,6 +141,7 @@ impl Ink<'_> {
         self.fill_path(&b.detach());
     }
 
+    #[expect(clippy::too_many_lines, reason = "a table: one arm per code point U+2500–U+257F, as in Ghostty")]
     fn box_drawing(&mut self, cp: u32) {
         use Style::{Double as D, Heavy as H, Light as L, None as N};
         let (light, heavy) = (self.light(), self.heavy());
@@ -285,6 +286,7 @@ impl Ink<'_> {
 
     /// Lines from the edges to the center, joined where they meet. A port of Ghostty's
     /// `linesChar`, with its saturating arithmetic.
+    #[expect(clippy::cognitive_complexity, reason = "kept in the shape of Ghostty's `linesChar` to check against it")]
     fn lines(&mut self, l: Lines) {
         use Style::{Double, Heavy, Light, None};
         let Cell { w, h, .. } = self.cell;

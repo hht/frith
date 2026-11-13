@@ -3,3 +3,22 @@
 rust = "1.99.1"
 # libghostty-vt builds only with Zig 0.17.x.
 zig = "0.17.1"
+# Gates, run by the `check` task.
+"github:kucherenko/jscpd" = "5.4.3"
+"aqua:EmbarkStudios/cargo-deny" = "0.20.2"
+
+# The gates every commit passes, in order. The git pre-commit hook runs it once installed
+# with `mise generate git-pre-commit --write --task=check`.
+[tasks.check]
+run = [
+    "cargo fmt --check",
+    "cargo clippy --workspace --all-targets --locked -- -D warnings",
+    "jscpd crates --format rust --exit-code",
+    "cargo deny check bans licenses sources",
+    "cargo test --workspace --locked",
+]
+
+# Security advisories for our dependencies. Kept out of `check`: it fetches the advisory
+# database, so it needs the network and its result changes with the world, not the commit.
+[tasks.audit]
+run = "cargo deny check advisories"
