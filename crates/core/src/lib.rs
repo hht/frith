@@ -3,6 +3,7 @@
 
 pub mod colors;
 pub mod config;
+pub mod flare;
 pub mod geom;
 pub mod gesture;
 pub mod layout;
