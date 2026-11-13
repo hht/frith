@@ -123,30 +123,42 @@ impl Pty {
 
 impl Drop for Pty {
     /// Hangs up the child's whole process group, as closing a terminal window does, and
-    /// reaps the child off the main thread. Only the child (the group leader) is waited for:
-    /// if it is still alive after `HANGUP_GRACE`, the group gets SIGKILL, since a hangup that
-    /// lands while a shell is between fork and exec can be lost (seen with zsh), and some
-    /// programs ignore SIGHUP. Once the leader is gone, members that ignore SIGHUP live on,
-    /// as `nohup` intends.
+    /// reaps the child off the main thread. A hangup that lands while a shell is between fork
+    /// and exec can be lost (seen with zsh, for the shell and for a job it just started). So
+    /// if the child (the group leader) is still alive after `HANGUP_GRACE`, the whole group
+    /// gets SIGKILL, since some programs also ignore SIGHUP. Once the leader is gone, the group
+    /// is hung up again every 10 ms until no live member is left or the grace ends; members
+    /// that ignore SIGHUP then live on, as `nohup` intends. Ghostty instead repeats its hangup
+    /// while the leader lives and stops once the leader is reaped, which leaves running a job
+    /// that missed every hangup sent while the leader lived.
+    /// @see https://github.com/ghostty-org/ghostty/blob/108cacb17ed8990840cd14abfce43d8ed8503ca1/src/termio/Exec.zig (`killPid`)
     fn drop(&mut self) {
         let Some(mut child) = self.child.take() else { return };
         // The child called setsid, so its pid is its process group id.
         let group = child.id() as libc::pid_t;
-        // SAFETY: plain syscall; a group that already exited yields ESRCH, which is fine.
-        unsafe { libc::killpg(group, libc::SIGHUP) };
+        hang_up(group);
         thread::spawn(move || {
             let deadline = Instant::now() + HANGUP_GRACE;
             while Instant::now() < deadline {
-                if !matches!(child.try_wait(), Ok(None)) {
+                if !matches!(child.try_wait(), Ok(None)) && !hang_up(group) {
                     return;
                 }
                 thread::sleep(Duration::from_millis(10));
             }
-            // SAFETY: plain syscall, as above.
-            unsafe { libc::killpg(group, libc::SIGKILL) };
-            let _ = child.wait();
+            if matches!(child.try_wait(), Ok(None)) {
+                // SAFETY: plain syscall; a group that already exited yields ESRCH, which is fine.
+                unsafe { libc::killpg(group, libc::SIGKILL) };
+                let _ = child.wait();
+            }
         });
     }
+}
+
+/// Sends SIGHUP to `group`; false once no member can get it: killpg(2) fails with ESRCH when
+/// the group is empty, and on macOS with EPERM when only zombies are left.
+fn hang_up(group: libc::pid_t) -> bool {
+    // SAFETY: plain syscall.
+    unsafe { libc::killpg(group, libc::SIGHUP) == 0 }
 }
 
 /// How long a hung-up child may take to exit before it is killed.
@@ -205,9 +217,11 @@ mod tests {
         assert!(out.contains("30 100"), "{out:?}");
     }
 
-    #[test]
-    fn dropping_ends_the_whole_process_group_and_reaps_the_child() {
-        let pty = spawn("sleep 100 & echo $! ; sleep 100");
+    /// Starts `line`, whose first line of output is a background job's pid and which ends with
+    /// `exec sleep`, reads the pid, and waits until the shell has become that `sleep`, so the
+    /// shell's own hangup cannot be lost.
+    fn spawn_with_job(line: &str) -> (Pty, libc::pid_t) {
+        let pty = spawn(line);
         let mut reader = pty.reader().unwrap();
         let mut line = Vec::new();
         let mut byte = [0u8];
@@ -215,15 +229,61 @@ mod tests {
             reader.read_exact(&mut byte).unwrap();
             line.push(byte[0]);
         }
-        let background: libc::pid_t = String::from_utf8_lossy(&line).trim().parse().unwrap();
+        let text = String::from_utf8_lossy(&line);
+        let job = text.trim().parse().unwrap_or_else(|e| panic!("{text:?}: {e}"));
+        let shell = pty.child.as_ref().unwrap().id().to_string();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let comm = || {
+            let _spawning = SPAWN.lock().unwrap_or_else(|e| e.into_inner());
+            Command::new("ps").args(["-o", "comm=", "-p", &shell]).output().unwrap().stdout
+        };
+        while comm() != b"sleep\n" {
+            assert!(Instant::now() < deadline, "the shell never ran its last command");
+            thread::sleep(Duration::from_millis(5));
+        }
+        (pty, job)
+    }
+
+    /// A zombie still counts as present.
+    fn gone(pid: libc::pid_t) -> bool {
+        (unsafe { libc::kill(pid, 0) }) != 0
+    }
+
+    #[test]
+    fn dropping_ends_the_whole_process_group_and_reaps_the_child() {
+        let (pty, background) = spawn_with_job("sleep 100 & echo $! ; exec sleep 100");
         let shell = pty.child.as_ref().unwrap().id() as libc::pid_t;
         drop(pty);
-        let gone = |pid| unsafe { libc::kill(pid, 0) } != 0; // a zombie still counts as present
         let deadline = Instant::now() + HANGUP_GRACE + Duration::from_secs(1);
         while !(gone(shell) && gone(background)) {
             assert!(Instant::now() < deadline, "shell or background job survived");
             thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    /// Starts `line` as `spawn_with_job` does, closes it, and tells whether the job is still
+    /// alive once the hangup grace is over; the job is killed either way.
+    fn job_outlives_its_pane(line: &str) -> bool {
+        let (pty, job) = spawn_with_job(line);
+        drop(pty);
+        thread::sleep(HANGUP_GRACE + Duration::from_millis(200));
+        let alive = !gone(job);
+        unsafe { libc::kill(job, libc::SIGKILL) };
+        alive
+    }
+
+    #[test]
+    fn a_job_that_missed_the_first_hangup_still_ends() {
+        // Deaf to the hangup sent at drop, the job listens again before the grace ends.
+        let line = "sh -c 'trap \"\" HUP; echo $$; sleep 0.3; trap - HUP; exec sleep 100' & exec sleep 100";
+        assert!(!job_outlives_its_pane(line), "a job that missed the first hangup survived its pane");
+    }
+
+    #[test]
+    fn a_job_that_ignores_hangups_outlives_its_pane() {
+        // The job prints its pid only once it ignores SIGHUP, and keeps that pid across exec.
+        let line = "sh -c 'trap \"\" HUP; echo $$; exec sleep 100' & exec sleep 100";
+        assert!(job_outlives_its_pane(line), "a job that ignores SIGHUP was killed");
     }
 
     #[test]
