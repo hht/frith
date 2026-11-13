@@ -12,6 +12,9 @@
 //! what the user typed or pasted. The `Terminal` is `!Send` and stays on the main thread.
 //! @see https://github.com/ghostty-org/ghostty/blob/108cacb17ed8990840cd14abfce43d8ed8503ca1/src/termio/Exec.zig (`queueWrite`)
 
+pub mod pty;
+pub mod shell;
+
 use std::cell::Cell;
 use std::ffi::{OsStr, OsString};
 use std::io::{ErrorKind, Read, Write};
@@ -34,11 +37,10 @@ use libghostty_vt::{mouse, paste};
 use winit::event::{ElementState, KeyEvent};
 use winit::keyboard::{Key as WKey, KeyCode, ModifiersState, PhysicalKey};
 
-use crate::pty::{self, Program, Pty};
-use crate::shell;
+use crate::pty::{Program, Pty};
 use frith_core::config::Config;
 
-pub const TERM: &str = "xterm-256color";
+pub(crate) const TERM: &str = "xterm-256color";
 const NAME: &str = "frith";
 
 /// Bytes of output the reader may hold for `feed`, enough for several frames of a fast stream;
@@ -355,7 +357,7 @@ impl Session {
         }
     }
 
-    pub fn wants_mouse(&self) -> bool {
+    pub(crate) fn wants_mouse(&self) -> bool {
         self.term.is_mouse_tracking().unwrap_or(false)
     }
 

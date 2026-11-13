@@ -19,6 +19,8 @@ use frith_core::gesture::{Effect, Gesture};
 use frith_core::layout::{Axis, Drop, Edge, Layout, PaneId};
 use frith_core::motion::Motion;
 use frith_core::scene::{self, ChromeButton, Frame, Guides, Hit, Metrics, PaneButton, Resize, Scene};
+use frith_term::pty::Program;
+use frith_term::{GridSize, Pad, Session, shell};
 use libghostty_vt::mouse;
 use skia_safe::Rect as SkRect;
 use winit::application::ApplicationHandler;
@@ -36,11 +38,8 @@ use crate::atlas::Atlas;
 use crate::fonts::{self, Fonts};
 use crate::gpu::Gpu;
 use crate::grid::Grid;
-use crate::pty::Program;
 use crate::render;
-use crate::shell;
 use crate::stage::{self, Kind, Origin, Pane, Shape, Stage};
-use crate::term::{GridSize, Pad, Session};
 use crate::{Cfg, unescape};
 
 /// Upper bound on PTY bytes parsed per pane per wake-up, so one flooding pane cannot starve

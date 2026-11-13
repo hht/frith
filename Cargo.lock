@@ -337,7 +337,7 @@ name = "frith"
 version = "0.0.0"
 dependencies = [
  "frith-core",
- "libc",
+ "frith-term",
  "libghostty-vt",
  "objc2",
  "objc2-app-kit",
@@ -352,6 +352,16 @@ dependencies = [
 [[package]]
 name = "frith-core"
 version = "0.0.0"
+
+[[package]]
+name = "frith-term"
+version = "0.0.0"
+dependencies = [
+ "frith-core",
+ "libc",
+ "libghostty-vt",
+ "winit",
+]
 
 [[package]]
 name = "futures-core"

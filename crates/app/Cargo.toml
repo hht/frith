@@ -1,4 +1,4 @@
-# The edges: window, GPU, PTY, terminal, fonts, platform integration.
+# The edges: window, GPU, drawing, fonts, platform integration.
 [package]
 name = "frith"
 version = "0.0.0"
@@ -7,10 +7,10 @@ publish.workspace = true
 
 [dependencies]
 frith-core = { path = "../core" }
+frith-term = { path = "../term" }
 winit = "=0.31.0-beta.4"
 skia-safe = { version = "=0.157.0", features = ["metal", "ganesh"] }
 libghostty-vt = { git = "https://github.com/Uzaaft/libghostty-rs", rev = "cd4d497e8c698b27054a677ce19d1bd1a1a4d8bf" }
-libc = "0.2.191"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6.5"

@@ -22,6 +22,7 @@ use frith_core::colors::Tint;
 use frith_core::geom::Rect;
 use frith_core::layout::PaneId;
 use frith_core::scene::{self, Hit, Metrics};
+use frith_term::Session;
 use skia_safe::gpu::{self, DirectContext, SurfaceOrigin};
 use skia_safe::{
     ClipOp, Color, FilterMode, Image, ImageInfo, Matrix, MipmapMode, Paint, RRect, Rect as SkRect, SamplingOptions,
@@ -30,7 +31,6 @@ use skia_safe::{
 use crate::atlas::Atlas;
 use crate::grid::{self, Grid};
 use crate::render::{self, PaneLook, Pen};
-use crate::term::Session;
 
 pub struct Pane {
     pub session: Session,

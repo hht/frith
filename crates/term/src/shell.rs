@@ -52,7 +52,7 @@ pub fn install(cache: &Path) -> io::Result<PathBuf> {
 
 /// The variables that make `shell` load the integration in `dir`, given the user's own
 /// ZDOTDIR. Only zsh is integrated so far (ADR 11).
-pub fn env(shell: &Path, dir: &Path, zdotdir: Option<OsString>) -> Vec<(&'static str, OsString)> {
+pub(crate) fn env(shell: &Path, dir: &Path, zdotdir: Option<OsString>) -> Vec<(&'static str, OsString)> {
     if shell.file_name() != Some(OsStr::new("zsh")) {
         return Vec::new();
     }

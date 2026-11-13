@@ -38,14 +38,14 @@ pub enum Program {
 
 /// Grid and pixel size reported to the child.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Size {
+pub(crate) struct Size {
     pub cols: u16,
     pub rows: u16,
     pub width: u16,
     pub height: u16,
 }
 
-pub struct Pty {
+pub(crate) struct Pty {
     master: File,
     /// `Some` until drop hands it to the reaper thread.
     child: Option<Child>,
@@ -166,7 +166,7 @@ fn set_cloexec(fd: &OwnedFd) -> io::Result<()> {
 
 /// The user's shell from the password database, which is set even when the app was started
 /// from Finder without a `SHELL` variable.
-pub fn login_shell() -> io::Result<PathBuf> {
+pub(crate) fn login_shell() -> io::Result<PathBuf> {
     let mut pw: libc::passwd = unsafe { std::mem::zeroed() };
     let mut buf = vec![0 as libc::c_char; 4096];
     let mut out = ptr::null_mut();
