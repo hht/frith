@@ -39,6 +39,7 @@ use crate::fonts::{self, Fonts};
 use crate::gpu::Gpu;
 use crate::grid::Grid;
 use crate::render;
+use crate::screens::Screens;
 use crate::stage::{Kind, Origin, Pane, Stage};
 use crate::{Cfg, unescape};
 
@@ -67,11 +68,23 @@ struct Win {
     metrics: Metrics,
     scale: f32,
     size: (u32, u32),
+    screens: Screens,
+    /// AppKit reports the window cannot be seen, as when minimized or covered.
+    occluded: bool,
+    /// A frame was skipped while hidden, so the window shows a stale one. Layout changes made
+    /// meanwhile stay unplaced, so they morph once the window shows.
+    missed: bool,
 }
 
 impl Win {
     fn px(&self, logical: f32) -> f32 {
         (logical * self.scale).round()
+    }
+
+    /// Nothing drawn would be seen. Frames then cost nothing; Ghostty skips them too.
+    /// @see Ghostty `src/renderer/Thread.zig` (`.visible`)
+    fn hidden(&self) -> bool {
+        self.occluded || self.screens.asleep()
     }
 }
 
@@ -178,6 +191,14 @@ impl App {
         self.win.as_ref().expect("the window exists once panes do")
     }
 
+    /// Once the window can be seen again, draws the frame skipped while it could not.
+    fn show_missed(&mut self) {
+        if let Some(w) = self.win.as_mut().filter(|w| w.missed && !w.hidden()) {
+            w.missed = false;
+            w.window.request_redraw();
+        }
+    }
+
     fn redraw(&self) {
         if let Some(w) = &self.win {
             w.window.request_redraw();
@@ -230,7 +251,10 @@ impl App {
         let ui = fonts::ui_font(UI_TEXT * scale);
         window.request_redraw();
         let metrics = Metrics::for_scale(scale);
-        self.win = Some(Win { window, gpu, fonts, ui, atlas, metrics, scale, size: (size.width, size.height) });
+        let screens = Screens::watch(self.proxy.clone());
+        let size = (size.width, size.height);
+        self.win =
+            Some(Win { window, gpu, fonts, ui, atlas, metrics, scale, size, screens, occluded: false, missed: false });
     }
 
     fn rescale(&mut self, scale: f32) {
@@ -401,9 +425,6 @@ impl App {
     }
 
     fn draw(&mut self) {
-        if self.win.is_none() {
-            return;
-        }
         let scene = self.scene();
         let frame_due = self.resize_sessions(&scene);
         let (lit, guides) = (self.lit_divider(), self.drag_guides(&scene));
@@ -1016,6 +1037,7 @@ impl ApplicationHandler for App {
     }
 
     fn proxy_wake_up(&mut self, el: &dyn ActiveEventLoop) {
+        self.show_missed();
         self.feed(el);
         self.settle(el);
     }
@@ -1039,7 +1061,14 @@ impl ApplicationHandler for App {
             return; // scripted runs drive the pointer themselves
         }
         match event {
-            WindowEvent::RedrawRequested => self.draw(),
+            WindowEvent::RedrawRequested => {
+                // A pending screenshot still draws, so scripted runs get it while hidden.
+                let w = self.win.as_mut().expect("window");
+                w.missed = w.hidden() && self.shot.is_none();
+                if !w.missed {
+                    self.draw();
+                }
+            }
             WindowEvent::CloseRequested => el.exit(),
             WindowEvent::SurfaceResized(size) => {
                 let w = self.win.as_mut().expect("window");
@@ -1048,6 +1077,10 @@ impl ApplicationHandler for App {
                 w.window.request_redraw();
             }
             WindowEvent::ScaleFactorChanged { scale_factor, .. } => self.rescale(scale_factor as f32),
+            WindowEvent::Occluded(occluded) => {
+                self.win.as_mut().expect("window").occluded = occluded;
+                self.show_missed();
+            }
             WindowEvent::Focused(false) => {
                 let effect = self.gesture.abort();
                 self.resizing = None;
